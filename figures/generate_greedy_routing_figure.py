@@ -7,7 +7,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
+from matplotlib.patches import ConnectionPatch, Ellipse, FancyArrowPatch
 import networkx as nx
 import numpy as np
 from PIL import Image
@@ -53,7 +53,7 @@ BASE_POSITIONS = {
     "b": (1.05, 4.62),
     "c": (2.35, 4.63),
     "w1": (3.58, 4.83),
-    "w2": (3.62, 0.83),
+    "w2": (3.20, 1.75),
     "g": (4.73, 4.47),
     "h": (4.78, 0.88),
     "i": (5.78, 4.38),
@@ -74,14 +74,6 @@ EXTRA_EDGES = [
 
 LOCAL_NEIGHBOURS = ["r2", "w1", "u", "w2"]
 LOCAL_LABELS = {"r2": r"$w_1$", "w1": r"$w_2$", "u": r"$u$", "w2": r"$w_3$"}
-LOCAL_POSITIONS = {
-    "v": (-1.25, 0.0),
-    "r2": (0.15, 1.38),
-    "w1": (0.35, 0.43),
-    "u": (0.42, -0.48),
-    "w2": (0.08, -1.38),
-    "t": (3.15, 0.0),
-}
 
 GREY_EDGE = "#c5c9cc"
 GREY_NODE = "#e5e7e8"
@@ -134,10 +126,38 @@ def validate_greedy_route(graph):
     return decisions
 
 
-def draw_arrow(ax, start, end, *, width=2.5, scale=12, zorder=5):
+def validate_local_decision(graph):
+    """Assert that u is the unique metric-minimising neighbour of v."""
+    neighbours = set(graph.neighbors("v"))
+    if neighbours != set(LOCAL_NEIGHBOURS):
+        raise ValueError(
+            f"Panel (b) neighbours {set(LOCAL_NEIGHBOURS)} do not match N(v)={neighbours}"
+        )
+    values = {node: METRIC_TO_TARGET[node] for node in neighbours}
+    if len(values.values()) != len(set(values.values())):
+        raise ValueError("The neighbours of v do not have strict metric values")
+    selected = min(values, key=values.__getitem__)
+    if selected != "u":
+        raise ValueError(f"u is not the unique closest neighbour of v; selected {selected}")
+    return values
+
+
+def build_local_positions(positions):
+    """Enlarge N(v) using the same relative coordinates as panel (a)."""
+    local_origin = np.array([-0.75, 0.18])
+    scale = 1.02
+    centre = positions["v"]
+    local = {"v": local_origin}
+    for node in LOCAL_NEIGHBOURS:
+        local[node] = local_origin + scale * (positions[node] - centre)
+    local["t"] = np.array([3.48, 0.18])
+    return local
+
+
+def draw_arrow(ax, start, end, *, width=2.9, scale=13.5, zorder=5):
     arrow = FancyArrowPatch(
         start, end, arrowstyle="-|>", mutation_scale=scale,
-        linewidth=width, color=BLUE, shrinkA=9, shrinkB=10, zorder=zorder,
+        linewidth=width, color=BLUE, shrinkA=10, shrinkB=11, zorder=zorder,
     )
     ax.add_patch(arrow)
 
@@ -147,7 +167,8 @@ def draw_panel_a(ax, graph, positions):
         graph, positions, edge_color=GREY_EDGE, width=0.85, alpha=0.95, ax=ax,
     )
     for start, end in ROUTE_EDGES:
-        draw_arrow(ax, positions[start], positions[end])
+        width = 3.6 if (start, end) == ("v", "u") else 2.9
+        draw_arrow(ax, positions[start], positions[end], width=width)
 
     ordinary = [node for node in graph if node not in ROUTE]
     route_nodes = [node for node in ROUTE if node not in {"s", "v", "u", "t"}]
@@ -181,6 +202,24 @@ def draw_panel_a(ax, graph, positions):
         ax.text(x + offset[0], y + offset[1], rf"${node}$",
                 ha="center", va="center", fontsize=14, zorder=8)
 
+    neighbour_offsets = {
+        "r2": (-0.19, -0.27),
+        "w1": (0.32, 0.00),
+        "w2": (0.26, -0.10),
+    }
+    for node in ["r2", "w1", "w2"]:
+        x, y = positions[node]
+        dx, dy = neighbour_offsets[node]
+        ax.text(x + dx, y + dy, LOCAL_LABELS[node],
+                ha="center", va="center", fontsize=11.5, zorder=8)
+
+    neighbourhood_outline = Ellipse(
+        (3.48, 3.18), width=3.18, height=3.72,
+        fill=False, edgecolor="#92999d", linewidth=0.9,
+        linestyle=(0, (4, 3)), zorder=0,
+    )
+    ax.add_patch(neighbourhood_outline)
+
     ax.text(0.02, 0.97, r"(a)", transform=ax.transAxes,
             ha="left", va="top", fontsize=13)
     ax.set_xlim(0.0, 6.78)
@@ -189,18 +228,19 @@ def draw_panel_a(ax, graph, positions):
     ax.axis("off")
 
 
-def draw_local_node(ax, node, colour, edgecolour, size=230):
-    x, y = LOCAL_POSITIONS[node]
+def draw_local_node(ax, local_positions, node, colour, edgecolour, size=230):
+    x, y = local_positions[node]
     ax.scatter(x, y, s=size, facecolor=colour, edgecolor=edgecolour,
                linewidth=1.1, zorder=5)
 
 
-def draw_panel_b(ax):
-    v_position = LOCAL_POSITIONS["v"]
-    t_position = LOCAL_POSITIONS["t"]
+def draw_panel_b(ax, positions):
+    local_positions = build_local_positions(positions)
+    v_position = local_positions["v"]
+    t_position = local_positions["t"]
 
     for neighbour in LOCAL_NEIGHBOURS:
-        point = LOCAL_POSITIONS[neighbour]
+        point = local_positions[neighbour]
         ax.plot(
             [v_position[0], point[0]], [v_position[1], point[1]],
             color="#8c9296", linewidth=1.15, zorder=1,
@@ -212,14 +252,15 @@ def draw_panel_b(ax):
             linestyle=(0, (3, 3)), zorder=1,
         )
 
-    draw_arrow(ax, v_position, LOCAL_POSITIONS["u"], width=2.7, scale=13, zorder=4)
+    draw_arrow(ax, local_positions["r2"], v_position, width=2.9, scale=13.5, zorder=4)
+    draw_arrow(ax, v_position, local_positions["u"], width=3.6, scale=14.5, zorder=4)
 
-    draw_local_node(ax, "v", V_COLOUR, "#574b6a", size=270)
-    draw_local_node(ax, "r2", GREY_NODE, "#666c70")
-    draw_local_node(ax, "w1", GREY_NODE, "#666c70")
-    draw_local_node(ax, "w2", GREY_NODE, "#666c70")
-    draw_local_node(ax, "u", U_COLOUR, "#3f6965", size=250)
-    draw_local_node(ax, "t", RED, "#7c3532", size=275)
+    draw_local_node(ax, local_positions, "v", V_COLOUR, "#574b6a", size=270)
+    draw_local_node(ax, local_positions, "r2", GREY_NODE, "#666c70")
+    draw_local_node(ax, local_positions, "w1", GREY_NODE, "#666c70")
+    draw_local_node(ax, local_positions, "w2", GREY_NODE, "#666c70")
+    draw_local_node(ax, local_positions, "u", U_COLOUR, "#3f6965", size=250)
+    draw_local_node(ax, local_positions, "t", RED, "#7c3532", size=275)
 
     ax.text(v_position[0] - 0.02, v_position[1] + 0.33, r"$v$",
             ha="center", va="center", fontsize=15, zorder=7)
@@ -232,16 +273,16 @@ def draw_panel_b(ax):
         "w2": (-0.20, -0.13),
     }
     for node, label in LOCAL_LABELS.items():
-        point = LOCAL_POSITIONS[node]
+        point = local_positions[node]
         offset = local_label_offsets[node]
         ax.text(point[0] + offset[0], point[1] + offset[1], label,
                 ha="right", va="center", fontsize=13.5, zorder=7)
 
     distance_labels = {
-        "r2": (1.65, 0.93, r"$d(w_1,t)=6.5$"),
-        "w1": (1.72, 0.31, r"$d(w_2,t)=5.8$"),
-        "u": (1.76, -0.32, r"$d(u,t)=3.4$  (smallest)"),
-        "w2": (1.63, -0.91, r"$d(w_3,t)=6.1$"),
+        "r2": (1.00, 0.24, r"$d(w_1,t)=6.5$"),
+        "w1": (1.42, 1.23, r"$d(w_2,t)=5.8$"),
+        "u": (2.08, -0.28, r"$d(u,t)=3.4$"),
+        "w2": (1.34, -0.99, r"$d(w_3,t)=6.1$"),
     }
     for node, (x, y, text) in distance_labels.items():
         ax.text(
@@ -252,16 +293,16 @@ def draw_panel_b(ax):
         )
 
     ax.text(
-        0.95, -1.92,
+        0.85, -2.12,
         r"$u=\underset{w\in N(v)}{\arg\min}\; d(w,t)$",
         ha="center", va="center", fontsize=13.5, color="#202224",
     )
-    ax.text(0.95, -2.25, r"$d$ denotes the chosen metric",
+    ax.text(0.85, -2.45, r"$d$ denotes the chosen metric",
             ha="center", va="center", fontsize=9.5, color="#666a6d")
     ax.text(0.02, 0.97, r"(b)", transform=ax.transAxes,
             ha="left", va="top", fontsize=13)
-    ax.set_xlim(-1.75, 3.55)
-    ax.set_ylim(-2.50, 1.88)
+    ax.set_xlim(-2.05, 3.75)
+    ax.set_ylim(-2.68, 2.02)
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
 
@@ -286,7 +327,15 @@ def draw_figure(graph, positions):
     ax_route.set_facecolor("white")
     ax_local.set_facecolor("white")
     draw_panel_a(ax_route, graph, positions)
-    draw_panel_b(ax_local)
+    draw_panel_b(ax_local, positions)
+
+    callout = ConnectionPatch(
+        xyA=(3.95, 4.94), coordsA=ax_route.transData,
+        xyB=(-1.84, 1.58), coordsB=ax_local.transData,
+        color="#92999d", linewidth=0.85, linestyle=(0, (4, 3)),
+        zorder=0, clip_on=False,
+    )
+    fig.add_artist(callout)
 
     fig.savefig(OUTPUT_PNG, dpi=600, bbox_inches="tight", pad_inches=0.10, facecolor="white")
     fig.savefig(OUTPUT_PDF, bbox_inches="tight", pad_inches=0.10, facecolor="white")
@@ -300,6 +349,7 @@ def main():
     positions = build_positions()
     graph = build_graph()
     decisions = validate_greedy_route(graph)
+    local_values = validate_local_decision(graph)
     draw_figure(graph, positions)
 
     for current, selected, value, degree in decisions:
@@ -308,6 +358,10 @@ def main():
             f"strict minimum d(w,t)={value:.1f} among {degree} neighbours"
         )
     print(f"Route reaches t in {len(ROUTE_EDGES)} steps without cycling")
+    print(
+        "Local decision at v verified: "
+        + ", ".join(f"d({node},t)={value:.1f}" for node, value in sorted(local_values.items()))
+    )
     print(f"Saved high-resolution figure to: {OUTPUT_PNG}")
     print(f"Saved vector figure to: {OUTPUT_PDF}")
 
