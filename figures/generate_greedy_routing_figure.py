@@ -1,4 +1,4 @@
-"""Generate a schematic of the local greedy-routing decision rule."""
+"""Generate a full-network illustration of greedy routing."""
 
 from pathlib import Path
 
@@ -9,169 +9,216 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch
 import networkx as nx
+import numpy as np
 from PIL import Image
 
 
 FIGURES_DIR = Path(__file__).resolve().parent
 OUTPUT_PNG = FIGURES_DIR / "greedy_routing_rule.png"
 OUTPUT_PDF = FIGURES_DIR / "greedy_routing_rule.pdf"
+SEED = 23
 
-CURRENT = "v"
-TARGET = "t"
-NEIGHBOURS = ["w_1", "w_2", "u", "w_3"]
-POSITIONS = {
-    CURRENT: (0.8, 2.5),
-    "w_1": (3.1, 4.15),
-    "w_2": (3.35, 3.05),
-    "u": (3.55, 1.85),
-    "w_3": (3.0, 0.65),
-    TARGET: (7.15, 2.05),
+ROUTE = ["s", "r1", "r2", "v", "u", "r5", "r6", "t"]
+ROUTE_EDGES = list(zip(ROUTE[:-1], ROUTE[1:]))
+
+# The route positions are fixed; a seeded, very small jitter makes the surrounding
+# network organic while keeping the mathematical routing decisions reproducible.
+BASE_POSITIONS = {
+    "s": (0.55, 2.75),
+    "r1": (1.85, 3.55),
+    "r2": (3.10, 2.85),
+    "v": (4.30, 3.55),
+    "u": (5.45, 2.95),
+    "r5": (6.65, 3.45),
+    "r6": (7.85, 2.80),
+    "t": (9.15, 3.10),
+    "a": (1.05, 0.75),
+    "b": (0.95, 4.85),
+    "c": (2.35, 5.15),
+    "d": (2.35, 1.25),
+    "e": (3.35, 4.75),
+    "f": (3.55, 0.65),
+    "w1": (4.55, 5.10),
+    "w2": (4.65, 1.05),
+    "g": (5.75, 4.70),
+    "h": (5.85, 1.05),
+    "i": (7.10, 4.85),
+    "j": (7.25, 0.85),
 }
-DISTANCES = {"w_1": 4.1, "w_2": 3.0, "u": 1.8, "w_3": 3.4}
+
+EXTRA_EDGES = [
+    # Alternatives at each greedy-routing decision.
+    ("s", "a"), ("s", "b"),
+    ("r1", "c"), ("r1", "d"),
+    ("r2", "e"), ("r2", "f"),
+    ("v", "w1"), ("v", "w2"),
+    ("u", "g"), ("u", "h"),
+    ("r5", "i"), ("r5", "j"),
+    ("r6", "i"), ("r6", "j"),
+    # Connections that make the background a coherent network.  The lower
+    # chain is shorter in hop count than the highlighted greedy route.
+    ("a", "d"), ("a", "f"), ("d", "f"),
+    ("f", "w2"), ("f", "h"), ("w2", "h"),
+    ("h", "j"), ("j", "t"),
+    ("b", "c"), ("c", "e"), ("e", "w1"),
+    ("w1", "g"), ("g", "i"), ("i", "t"),
+    ("c", "r2"), ("e", "v"), ("g", "r5"),
+]
 
 
-def midpoint(a, b, fraction=0.55):
-    """Return a point at ``fraction`` of the segment from a to b."""
-    return (
-        a[0] + fraction * (b[0] - a[0]),
-        a[1] + fraction * (b[1] - a[1]),
+def build_positions():
+    """Return deterministic node coordinates."""
+    rng = np.random.default_rng(SEED)
+    positions = {}
+    for node, point in BASE_POSITIONS.items():
+        if node in ROUTE:
+            positions[node] = np.asarray(point, dtype=float)
+        else:
+            positions[node] = np.asarray(point, dtype=float) + rng.uniform(-0.07, 0.07, 2)
+    return positions
+
+
+def build_graph():
+    graph = nx.Graph()
+    graph.add_nodes_from(BASE_POSITIONS)
+    graph.add_edges_from(ROUTE_EDGES)
+    graph.add_edges_from(EXTRA_EDGES)
+    return graph
+
+
+def distance_to_target(node, positions):
+    return float(np.linalg.norm(positions[node] - positions["t"]))
+
+
+def validate_greedy_route(graph, positions):
+    """Assert that every drawn move is the local greedy choice."""
+    decisions = []
+    for current, selected in ROUTE_EDGES:
+        neighbours = list(graph.neighbors(current))
+        best = min(neighbours, key=lambda node: distance_to_target(node, positions))
+        if best != selected:
+            raise ValueError(
+                f"Invalid greedy step at {current}: expected {selected}, but {best} is closer to t"
+            )
+        decisions.append(
+            (current, selected, distance_to_target(selected, positions), len(neighbours))
+        )
+
+    greedy_hops = len(ROUTE_EDGES)
+    shortest_hops = nx.shortest_path_length(graph, "s", "t")
+    if shortest_hops >= greedy_hops:
+        raise ValueError("The background graph should contain a shorter hop-count route")
+    return decisions, shortest_hops
+
+
+def draw_nodes(graph, positions, ax):
+    background = [node for node in graph if node not in ROUTE and node not in {"w1", "w2"}]
+    nx.draw_networkx_nodes(
+        graph, positions, nodelist=background, node_size=165,
+        node_color="#e3e5e6", edgecolors="#70757a", linewidths=0.75, ax=ax,
+    )
+    nx.draw_networkx_nodes(
+        graph, positions, nodelist=ROUTE[1:-1], node_size=220,
+        node_color="#d7e4ed", edgecolors="#315f7d", linewidths=1.0, ax=ax,
+    )
+    nx.draw_networkx_nodes(
+        graph, positions, nodelist=["w1", "w2"], node_size=205,
+        node_color="#eeeeee", edgecolors="#62676b", linewidths=0.9, ax=ax,
+    )
+    nx.draw_networkx_nodes(
+        graph, positions, nodelist=["s"], node_size=330,
+        node_color="#79a986", edgecolors="#315c3c", linewidths=1.2, ax=ax,
+    )
+    nx.draw_networkx_nodes(
+        graph, positions, nodelist=["t"], node_size=350,
+        node_color="#c96b67", edgecolors="#7c3532", linewidths=1.2, ax=ax,
+    )
+    # A stronger outline distinguishes the current and selected local vertices.
+    nx.draw_networkx_nodes(
+        graph, positions, nodelist=["v", "u"], node_size=255,
+        node_color=["#c9dce8", "#a9c9dc"], edgecolors="#244f6c",
+        linewidths=1.5, ax=ax,
     )
 
 
-def draw_figure():
+def draw_route_arrows(positions, ax):
+    for start, end in ROUTE_EDGES:
+        arrow = FancyArrowPatch(
+            positions[start], positions[end],
+            arrowstyle="-|>", mutation_scale=12.5,
+            linewidth=2.8, color="#2f6f9f",
+            shrinkA=9.5, shrinkB=10.5, zorder=5,
+        )
+        ax.add_patch(arrow)
+
+
+def draw_figure(graph, positions):
     FIGURES_DIR.mkdir(exist_ok=True)
     plt.rcParams.update(
         {
             "font.family": "serif",
             "font.serif": ["Computer Modern Roman", "CMU Serif", "DejaVu Serif"],
-            "font.size": 13,
+            "font.size": 12,
             "mathtext.fontset": "cm",
-            "axes.linewidth": 0.8,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
         }
     )
 
-    graph = nx.Graph()
-    graph.add_edges_from((CURRENT, neighbour) for neighbour in NEIGHBOURS)
-
-    fig, ax = plt.subplots(figsize=(8.4, 5.0), facecolor="white")
+    fig, ax = plt.subplots(figsize=(9.2, 5.8), facecolor="white")
     ax.set_facecolor("white")
 
-    # Local graph edges incident to the current vertex.
     nx.draw_networkx_edges(
-        graph,
-        POSITIONS,
-        edgelist=[(CURRENT, neighbour) for neighbour in NEIGHBOURS],
-        edge_color="#777777",
-        width=1.35,
-        ax=ax,
+        graph, positions, edge_color="#c2c6c9", width=0.85, alpha=0.95, ax=ax,
     )
+    local_edges = [("v", node) for node in graph.neighbors("v")]
+    nx.draw_networkx_edges(
+        graph, positions, edgelist=local_edges,
+        edge_color="#8b9297", width=1.15, ax=ax,
+    )
+    draw_route_arrows(positions, ax)
+    draw_nodes(graph, positions, ax)
 
-    # Geometric distances used for the local decision (not graph edges).
-    for neighbour in NEIGHBOURS:
-        start, end = POSITIONS[neighbour], POSITIONS[TARGET]
-        ax.plot(
-            [start[0], end[0]],
-            [start[1], end[1]],
-            color="#9a9a9a" if neighbour != "u" else "#4f6f88",
-            linewidth=1.05 if neighbour != "u" else 1.45,
-            linestyle=(0, (3, 3)),
-            zorder=1,
-        )
-        label_xy = midpoint(start, end, 0.58)
-        y_offset = {"w_1": 0.14, "w_2": 0.12, "u": -0.15, "w_3": -0.13}[neighbour]
+    label_specs = {
+        "s": (r"$s$", (-0.02, 0.34)),
+        "t": (r"$t$", (0.02, 0.34)),
+        "v": (r"$v$", (-0.02, 0.30)),
+        "u": (r"$u$", (0.00, -0.34)),
+        "w1": (r"$w_1$", (0.34, 0.02)),
+        "w2": (r"$w_2$", (0.35, -0.02)),
+    }
+    for node, (label, offset) in label_specs.items():
+        x, y = positions[node]
         ax.text(
-            label_xy[0],
-            label_xy[1] + y_offset,
-            rf"$d({neighbour},t)={DISTANCES[neighbour]:.1f}$",
-            ha="center",
-            va="center",
-            fontsize=11.5,
-            color="#333333",
-            bbox=dict(facecolor="white", edgecolor="none", pad=0.7, alpha=0.92),
-            zorder=4,
+            x + offset[0], y + offset[1], label,
+            ha="center", va="center", fontsize=15,
+            color="#1e1f20", zorder=8,
         )
 
-    node_colours = ["#d9d9d9" if n != "u" else "#b7cbd8" for n in NEIGHBOURS]
-    nx.draw_networkx_nodes(
-        graph,
-        POSITIONS,
-        nodelist=NEIGHBOURS,
-        node_color=node_colours,
-        edgecolors="#333333",
-        linewidths=1.1,
-        node_size=720,
-        ax=ax,
+    ax.annotate(
+        r"At $v$, choose $u$: the neighbour of $v$ closest to $t$.",
+        xy=positions["u"], xycoords="data",
+        xytext=(5.42, 1.80), textcoords="data",
+        ha="center", va="center", fontsize=11.5, color="#243d4d",
+        bbox=dict(boxstyle="round,pad=0.30", facecolor="white",
+                  edgecolor="#8296a3", linewidth=0.8),
+        arrowprops=dict(arrowstyle="->", color="#55798f", linewidth=1.0,
+                        shrinkA=5, shrinkB=10, connectionstyle="arc3,rad=-0.12"),
+        zorder=9,
     )
-    nx.draw_networkx_nodes(
-        graph,
-        POSITIONS,
-        nodelist=[CURRENT],
-        node_color="#ececec",
-        edgecolors="#222222",
-        linewidths=1.3,
-        node_size=800,
-        ax=ax,
-    )
-    ax.scatter(
-        *POSITIONS[TARGET],
-        s=820,
-        facecolor="white",
-        edgecolor="#222222",
-        linewidth=1.5,
-        zorder=3,
-    )
-
-    labels = {CURRENT: r"$v$", TARGET: r"$t$", "u": r"$u$",
-              "w_1": r"$w_1$", "w_2": r"$w_2$", "w_3": r"$w_3$"}
-    for node, label in labels.items():
-        ax.text(*POSITIONS[node], label, ha="center", va="center", fontsize=17,
-                fontweight="bold" if node in {CURRENT, TARGET, "u"} else "normal", zorder=5)
-
-    # Overlay the selected routing step as a directed, high-contrast arrow.
-    selected_arrow = FancyArrowPatch(
-        POSITIONS[CURRENT],
-        POSITIONS["u"],
-        arrowstyle="-|>",
-        mutation_scale=18,
-        linewidth=3.0,
-        color="#2f6688",
-        shrinkA=24,
-        shrinkB=25,
-        zorder=6,
-    )
-    ax.add_patch(selected_arrow)
-    ax.text(2.0, 1.83, "selected step", color="#2f6688", fontsize=11.5,
-            ha="center", va="bottom", rotation=-13)
-
-    # Identify the candidate set without crowding the node labels.
     ax.text(
-        2.85,
-        4.70,
-        r"candidate neighbours $N(v)$",
-        ha="center",
-        va="center",
-        fontsize=13,
-        color="#333333",
+        4.58, 4.50, r"local neighbourhood $N(v)$",
+        ha="center", va="center", fontsize=10.8, color="#555b5f",
+    )
+    ax.annotate(
+        "greedy route",
+        xy=(2.55, 3.12), xytext=(1.80, 2.25),
+        ha="center", va="center", fontsize=11.5, color="#2f6f9f",
+        arrowprops=dict(arrowstyle="->", color="#2f6f9f", linewidth=1.0),
     )
 
-    ax.text(
-        4.25,
-        -0.50,
-        r"$u=\underset{w\in N(v)}{\arg\min}\; d(w,t)$"
-        "\n" r"$d(u,t)=1.8$ is the smallest candidate distance",
-        ha="center",
-        va="center",
-        fontsize=14,
-        color="#1f1f1f",
-        bbox=dict(boxstyle="round,pad=0.35", facecolor="#f5f5f5",
-                  edgecolor="#777777", linewidth=0.9),
-        zorder=7,
-    )
-
-    ax.set_xlim(0.1, 7.9)
-    ax.set_ylim(-1.05, 5.0)
+    ax.set_xlim(0.0, 9.65)
+    ax.set_ylim(0.15, 5.65)
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
     fig.tight_layout(pad=0.25)
@@ -179,16 +226,25 @@ def draw_figure():
     fig.savefig(OUTPUT_PDF, bbox_inches="tight", pad_inches=0.12, facecolor="white")
     plt.close(fig)
 
-    # Store an opaque RGB PNG so viewers do not substitute a dark background.
+    # Store an opaque RGB PNG so viewers consistently show a white background.
     with Image.open(OUTPUT_PNG) as image:
         image.convert("RGB").save(OUTPUT_PNG, dpi=(600, 600))
-    return OUTPUT_PNG, OUTPUT_PDF
 
 
 def main():
-    png_path, pdf_path = draw_figure()
-    print(f"Saved high-resolution figure to: {png_path}")
-    print(f"Saved vector figure to: {pdf_path}")
+    positions = build_positions()
+    graph = build_graph()
+    decisions, shortest_hops = validate_greedy_route(graph, positions)
+    draw_figure(graph, positions)
+
+    for current, selected, distance, degree in decisions:
+        print(
+            f"Greedy step {current} -> {selected}: "
+            f"minimum distance to t is {distance:.3f} among {degree} neighbours"
+        )
+    print(f"Greedy route: {len(ROUTE_EDGES)} hops; graph shortest path: {shortest_hops} hops")
+    print(f"Saved high-resolution figure to: {OUTPUT_PNG}")
+    print(f"Saved vector figure to: {OUTPUT_PDF}")
 
 
 if __name__ == "__main__":
