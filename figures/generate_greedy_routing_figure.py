@@ -7,7 +7,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from matplotlib.patches import ConnectionPatch, Ellipse, FancyArrowPatch
+from matplotlib.patches import FancyArrowPatch
 import networkx as nx
 import numpy as np
 from PIL import Image
@@ -202,24 +202,6 @@ def draw_panel_a(ax, graph, positions):
         ax.text(x + offset[0], y + offset[1], rf"${node}$",
                 ha="center", va="center", fontsize=14, zorder=8)
 
-    neighbour_offsets = {
-        "r2": (-0.19, -0.27),
-        "w1": (0.32, 0.00),
-        "w2": (0.26, -0.10),
-    }
-    for node in ["r2", "w1", "w2"]:
-        x, y = positions[node]
-        dx, dy = neighbour_offsets[node]
-        ax.text(x + dx, y + dy, LOCAL_LABELS[node],
-                ha="center", va="center", fontsize=11.5, zorder=8)
-
-    neighbourhood_outline = Ellipse(
-        (3.48, 3.18), width=3.18, height=3.72,
-        fill=False, edgecolor="#92999d", linewidth=0.9,
-        linestyle=(0, (4, 3)), zorder=0,
-    )
-    ax.add_patch(neighbourhood_outline)
-
     ax.text(0.02, 0.97, r"(a)", transform=ax.transAxes,
             ha="left", va="top", fontsize=13)
     ax.set_xlim(0.0, 6.78)
@@ -247,8 +229,8 @@ def draw_panel_b(ax, positions):
         )
         ax.plot(
             [point[0], t_position[0]], [point[1], t_position[1]],
-            color="#aeb3b6" if neighbour != "u" else "#648a87",
-            linewidth=0.9 if neighbour != "u" else 1.15,
+            color="#d0d4d6" if neighbour != "u" else "#abc0be",
+            linewidth=0.75 if neighbour != "u" else 0.9,
             linestyle=(0, (3, 3)), zorder=1,
         )
 
@@ -279,10 +261,10 @@ def draw_panel_b(ax, positions):
                 ha="right", va="center", fontsize=13.5, zorder=7)
 
     distance_labels = {
-        "r2": (1.00, 0.24, r"$d(w_1,t)=6.5$"),
-        "w1": (1.42, 1.23, r"$d(w_2,t)=5.8$"),
-        "u": (2.08, -0.28, r"$d(u,t)=3.4$"),
-        "w2": (1.34, -0.99, r"$d(w_3,t)=6.1$"),
+        "r2": (0.82, 0.42, r"$d(w_1,t)=6.5$"),
+        "w1": (1.45, 1.34, r"$d(w_2,t)=5.8$"),
+        "u": (2.12, -0.30, r"$d(u,t)=3.4$"),
+        "w2": (1.38, -1.10, r"$d(w_3,t)=6.1$"),
     }
     for node, (x, y, text) in distance_labels.items():
         ax.text(
@@ -328,14 +310,6 @@ def draw_figure(graph, positions):
     ax_local.set_facecolor("white")
     draw_panel_a(ax_route, graph, positions)
     draw_panel_b(ax_local, positions)
-
-    callout = ConnectionPatch(
-        xyA=(3.95, 4.94), coordsA=ax_route.transData,
-        xyB=(-1.84, 1.58), coordsB=ax_local.transData,
-        color="#92999d", linewidth=0.85, linestyle=(0, (4, 3)),
-        zorder=0, clip_on=False,
-    )
-    fig.add_artist(callout)
 
     fig.savefig(OUTPUT_PNG, dpi=600, bbox_inches="tight", pad_inches=0.10, facecolor="white")
     fig.savefig(OUTPUT_PDF, bbox_inches="tight", pad_inches=0.10, facecolor="white")
