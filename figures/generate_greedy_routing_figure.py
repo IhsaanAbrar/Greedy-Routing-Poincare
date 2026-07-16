@@ -275,16 +275,16 @@ def draw_panel_b(ax, positions):
         )
 
     ax.text(
-        0.85, -2.12,
+        0.85, -1.98,
         r"$u=\underset{w\in N(v)}{\arg\min}\; d(w,t)$",
         ha="center", va="center", fontsize=13.5, color="#202224",
     )
-    ax.text(0.85, -2.45, r"$d$ denotes the chosen metric",
+    ax.text(0.85, -2.52, r"$d$ denotes the chosen metric",
             ha="center", va="center", fontsize=9.5, color="#666a6d")
     ax.text(0.02, 0.97, r"(b)", transform=ax.transAxes,
             ha="left", va="top", fontsize=13)
     ax.set_xlim(-2.05, 3.75)
-    ax.set_ylim(-2.68, 2.02)
+    ax.set_ylim(-2.75, 2.02)
     ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
 
