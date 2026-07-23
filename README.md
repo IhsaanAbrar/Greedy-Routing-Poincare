@@ -65,8 +65,6 @@ records a SHA-256 fingerprint over the exact Stage 1-11 source modules.
 
 - `code/`: experiment configuration and implementation modules.
 - `tests/`: deterministic unit and integration tests.
-- `research/`: mathematical background, implementation methodology, and the
-  pre-full-experiment audit.
 - `figures/`: existing explanatory figure generators and assets.
 - `data/`: policy-controlled location for small intentional inputs only; the
   current pipeline needs no input dataset.
@@ -116,11 +114,3 @@ Euclidean greedy, hyperbolic greedy, and repaired hyperbolic routing, or
 draws, or 9,180 total generator calls including one call per BA graph. The full
 experiment must not run until the embedding method and full settings receive
 explicit approval.
-
-See `research/methodology_implementation.md` for formulas, validation rules,
-repair semantics, reproducibility controls, and limitations. See
-`research/pre_full_experiment_review.md` for the bounded performance benchmark
-and pre-commit audit. The unresolved scientific embedding choice is compared in
-`research/embedding_method_decision.md`; full-setting classifications,
-connected-ER options, checkpointing, timing, and the manual review checklist
-are in `research/full_experiment_approval.md`.
