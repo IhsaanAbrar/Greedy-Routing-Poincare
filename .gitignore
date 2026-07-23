@@ -202,6 +202,19 @@ cython_debug/
 # .vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
+tmp/
+*.tmp
+*.bak
+*.swp
+*~
+
+# Generated experiment output
+results/
+outputs/
+
+# Local AI-tool application metadata (never publish)
+/.agents/
+/.codex/
 
 # Ruff stuff:
 .ruff_cache/
