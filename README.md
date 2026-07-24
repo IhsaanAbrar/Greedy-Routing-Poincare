@@ -128,9 +128,22 @@ It uses three excluded development graphs and five pairs per graph. It prints
 diagnostics and workload counts, writes no outputs or plots, and does not run
 the full configuration.
 
+## Excluded capacity benchmark
+
+Run the bounded, non-scientific Step 15 runtime-and-storage benchmark with:
+
+```powershell
+.\.venv\Scripts\python.exe -B code\benchmark_experiment_capacity.py
+```
+
+It runs only the six excluded feasibility-seed graphs, removes their temporary
+checkpoints after validation, and writes `code/step15_capacity_profile.json`.
+Rerun it with `--output-root <path>` before using a different output volume.
+
 ## Production runner and checkpoints
 
-The Step 14 preflight is read-only and must pass before a production run:
+The Step 14 production preflight is read-only and requires a valid Step 15
+capacity profile for the target output volume:
 
 ```powershell
 .\.venv\Scripts\python.exe -B code\run_full_experiment.py preflight --mode full --confirm-full-run 8e002ef20f96a4f66c80440c9734cd28b6c0851a95a7977d5e2b7cf905f7a78a

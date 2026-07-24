@@ -21,6 +21,11 @@ from typing import Any
 
 import networkx as nx
 
+from benchmark_experiment_capacity import (
+    CapacityProfileError,
+    load_capacity_profile,
+    volume_identifier,
+)
 from embedding import calculate_embedding_distortion, prepare_embedding_input
 from experiment_checkpoint import (
     CHECKPOINT_DIRECTORY,
@@ -162,6 +167,7 @@ class PreflightReport:
     run_manifest: Mapping[str, object]
     checkpoint_audit: CheckpointAudit
     free_disk_bytes: int
+    capacity_status: Mapping[str, object] | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -192,8 +198,13 @@ class PreflightReport:
             ),
             "resumable": self.checkpoint_audit.resumable,
             "checkpoint_errors": list(self.checkpoint_audit.errors),
+            "capacity": (
+                dict(self.capacity_status)
+                if self.capacity_status is not None
+                else None
+            ),
             "disk_space_policy": (
-                "reported_only_no_unvalidated_minimum_threshold"
+                "step15_profile_required_for_full_mode"
             ),
         }
 
@@ -408,6 +419,64 @@ def preflight(
         require_final_scientific_source=False,
         timestamp=timestamp,
     )
+    current_volume = volume_identifier(declared_output)
+    free_bytes = shutil.disk_usage(_nearest_existing_parent(declared_output)).free
+    capacity_status: dict[str, object] = {
+        "profile_present": False,
+        "profile_valid": False,
+        "benchmark_volume_identifier": None,
+        "current_output_volume_identifier": current_volume,
+        "projected_storage_bytes": None,
+        "required_free_bytes": None,
+        "current_available_bytes": free_bytes,
+        "disk_space_pass": False,
+        "nominal_projected_runtime_seconds": None,
+        "conservative_projected_runtime_seconds": None,
+        "error": None,
+    }
+    capacity_profile: dict[str, object] | None = None
+    if mode == "full":
+        try:
+            capacity_profile = load_capacity_profile(
+                expected_volume_identifier=current_volume,
+                current_available_bytes=free_bytes,
+            )
+            capacity_status.update(
+                {
+                    "profile_present": True,
+                    "profile_valid": True,
+                    "benchmark_volume_identifier": capacity_profile[
+                        "volume_identifier"
+                    ],
+                    "projected_storage_bytes": capacity_profile[
+                        "projected_storage_bytes"
+                    ],
+                    "required_free_bytes": capacity_profile[
+                        "required_free_bytes"
+                    ],
+                    "disk_space_pass": True,
+                    "nominal_projected_runtime_seconds": capacity_profile[
+                        "runtime_projection"
+                    ]["nominal_projected_runtime_seconds"],
+                    "conservative_projected_runtime_seconds": capacity_profile[
+                        "runtime_projection"
+                    ]["conservative_projected_runtime_seconds"],
+                    "profile_sha256": capacity_profile["profile_sha256"],
+                }
+            )
+            manifest["capacity_profile"] = {
+                "profile_schema_version": capacity_profile[
+                    "profile_schema_version"
+                ],
+                "profile_sha256": capacity_profile["profile_sha256"],
+                "volume_identifier": capacity_profile["volume_identifier"],
+                "required_free_bytes": capacity_profile["required_free_bytes"],
+            }
+        except CapacityProfileError as exc:
+            capacity_status["profile_present"] = (
+                "missing" not in str(exc).lower()
+            )
+            capacity_status["error"] = str(exc)
     run_root = _resolved_inside(
         declared_output,
         str(manifest["run_directory_name"]),
@@ -443,9 +512,13 @@ def preflight(
     pins = _requirements_pins(repository_root())
     if manifest["dependency_versions"] != pins:
         reasons.append("installed dependency versions do not match requirements.txt")
+    if mode == "full" and capacity_profile is None:
+        reasons.append(
+            "valid Step 15 capacity profile and sufficient output-volume "
+            "space are required"
+        )
     if audit.errors:
         reasons.append("run directory contains incompatible or corrupt state")
-    free_bytes = shutil.disk_usage(_nearest_existing_parent(declared_output)).free
     return PreflightReport(
         authorized=not reasons,
         authorization_reasons=tuple(reasons),
@@ -455,6 +528,7 @@ def preflight(
         run_manifest=manifest,
         checkpoint_audit=audit,
         free_disk_bytes=free_bytes,
+        capacity_status=capacity_status,
     )
 
 
@@ -757,6 +831,7 @@ def _execute_generated_graph(
         pair_master_seed,
         graph_identity=entry.canonical_pair_graph_identity,
     )
+    routing_preparation_start = perf_counter_ns()
     contexts: dict[str, tuple[object, object, float, float]] = {}
     for condition in conditions:
         euclidean_context = _call_stage(
@@ -791,9 +866,13 @@ def _execute_generated_graph(
             euclidean_tolerance,
             config.numerical_tolerance,
         )
+    timings["routing_coordinate_preparation_ns"] = (
+        perf_counter_ns() - routing_preparation_start
+    )
 
     dijkstra_records: list[dict[str, object]] = []
     route_records: list[dict[str, object]] = []
+    record_construction_ns = 0
     aggregate = {
         "actual_dijkstra_ns": 0,
         "routing_euclidean_greedy_ns": 0,
@@ -813,6 +892,7 @@ def _execute_generated_graph(
             ),
         )
         aggregate["actual_dijkstra_ns"] += runtime
+        record_start = perf_counter_ns()
         dijkstra_records.append(
             {
                 "graph_id": entry.graph_id,
@@ -830,6 +910,7 @@ def _execute_generated_graph(
                 "walk": list(benchmark.walk),
             }
         )
+        record_construction_ns += perf_counter_ns() - record_start
 
         mds_euclidean_reference: tuple[bool, tuple[int, ...], str | None] | None = None
         for condition in conditions:
@@ -886,6 +967,7 @@ def _execute_generated_graph(
                         raise RuntimeError(
                             "nested MDS scaling changed Euclidean routing"
                         )
+                record_start = perf_counter_ns()
                 route_records.append(
                     _routing_record(
                         graph_id=entry.graph_id,
@@ -898,7 +980,9 @@ def _execute_generated_graph(
                         runtime_ns=route_runtime,
                     )
                 )
+                record_construction_ns += perf_counter_ns() - record_start
     timings.update(aggregate)
+    timings["record_construction_ns"] = record_construction_ns
     if len(dijkstra_records) != pair_count:
         raise RuntimeError("Dijkstra must execute exactly once per sampled pair")
     if len(route_records) != pair_count * 15:

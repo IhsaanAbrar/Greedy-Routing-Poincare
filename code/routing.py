@@ -66,6 +66,11 @@ class PreparedRoutingCoordinates(Mapping[int, Coordinate]):
     _graph_reference: ReferenceType[nx.Graph] = field(repr=False, compare=False)
     _topology_graph: nx.Graph = field(repr=False, compare=False)
     _distance_function: DistanceFunction = field(repr=False, compare=False)
+    _distance_cache: dict[tuple[int, int], float] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
     def __getitem__(self, node: int) -> Coordinate:
         return self._coordinates[node]
@@ -96,6 +101,26 @@ class PreparedRoutingCoordinates(Mapping[int, Coordinate]):
         """Return the private frozen topology snapshot used for routing."""
 
         return self._topology_graph
+
+    def distance(self, first_node: int, second_node: int) -> float:
+        """Return one exact metric result, cached for the active destination."""
+
+        key = (first_node, second_node)
+        if (
+            self._distance_cache
+            and next(iter(self._distance_cache))[1] != second_node
+        ):
+            self._distance_cache.clear()
+        cached = self._distance_cache.get(key)
+        if cached is not None:
+            return cached
+        value = _checked_distance(
+            self._distance_function,
+            self._coordinates[first_node],
+            self._coordinates[second_node],
+        )
+        self._distance_cache[key] = value
+        return value
 
 
 @dataclass(frozen=True)
@@ -414,6 +439,21 @@ def _checked_distance(
     return value
 
 
+def _node_distance(
+    coordinates: Mapping[int, Coordinate],
+    first_node: int,
+    second_node: int,
+    distance_function: DistanceFunction,
+) -> float:
+    if isinstance(coordinates, PreparedRoutingCoordinates):
+        return coordinates.distance(first_node, second_node)
+    return _checked_distance(
+        distance_function,
+        coordinates[first_node],
+        coordinates[second_node],
+    )
+
+
 def _validate_coordinate_coverage(
     graph: nx.Graph,
     coordinates: Mapping[int, Coordinate],
@@ -564,10 +604,11 @@ def _select_best_neighbour(
     ranked = [
         (
             neighbour,
-            _checked_distance(
+            _node_distance(
+                coordinates,
+                neighbour,
+                destination,
                 distance_function,
-                coordinates[neighbour],
-                coordinates[destination],
             ),
         )
         for neighbour in neighbours
@@ -623,10 +664,11 @@ def _continue_greedy_walk(
                 False, tuple(walk), CYCLE, forwarding_decisions
             )
 
-        current_distance = _checked_distance(
+        current_distance = _node_distance(
+            coordinates,
+            current,
+            destination,
             distance_function,
-            coordinates[current],
-            coordinates[destination],
         )
         if not selected_distance < current_distance - tolerance:
             return _GreedyOutcome(

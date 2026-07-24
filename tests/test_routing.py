@@ -434,6 +434,65 @@ class PreparedRoutingCoordinatesTests(unittest.TestCase):
             preparation_call_count + graph.number_of_nodes() ** 2,
         )
 
+    def test_prepared_context_caches_exact_distances_without_changing_results(self):
+        graph, coordinates = self.repair_fixture()
+        calls = []
+
+        def counted_euclidean_distance(first, second):
+            calls.append((tuple(first), tuple(second)))
+            return euclidean_distance(first, second)
+
+        context = prepare_routing_coordinates(
+            graph,
+            coordinates,
+            counted_euclidean_distance,
+        )
+        preparation_call_count = len(calls)
+        first = greedy_route(
+            graph,
+            context,
+            0,
+            4,
+            counted_euclidean_distance,
+            method_name="counted_euclidean",
+        )
+        first_route_call_count = len(calls)
+        repeated = greedy_route(
+            graph,
+            context,
+            0,
+            4,
+            counted_euclidean_distance,
+            method_name="counted_euclidean",
+        )
+        raw = greedy_route(
+            graph,
+            coordinates,
+            0,
+            4,
+            euclidean_distance,
+            method_name="counted_euclidean",
+        )
+
+        self.assertGreater(first_route_call_count, preparation_call_count)
+        self.assertEqual(len(calls), first_route_call_count)
+        self.assertEqual(repeated, first)
+        self.assertEqual(first, raw)
+
+        greedy_route(
+            graph,
+            context,
+            0,
+            3,
+            counted_euclidean_distance,
+            method_name="counted_euclidean",
+        )
+        self.assertTrue(context._distance_cache)
+        self.assertTrue(
+            all(destination == 3 for _, destination in context._distance_cache)
+        )
+        self.assertLessEqual(len(context._distance_cache), graph.number_of_nodes())
+
 
 class EuclideanGreedyTests(RoutingTestCase):
     def test_direct_success(self):

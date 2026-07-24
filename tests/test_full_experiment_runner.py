@@ -430,7 +430,7 @@ class PreflightSafetyTests(unittest.TestCase):
             self.assertEqual(len(payload["schedule_ids"]), 360)
             self.assertEqual(
                 payload["disk_space_policy"],
-                "reported_only_no_unvalidated_minimum_threshold",
+                "step15_profile_required_for_full_mode",
             )
 
 
@@ -597,6 +597,8 @@ class DevelopmentFixtureTests(unittest.TestCase):
             )
             self.assertIn("actual_dijkstra_ns", data.timings)
             self.assertIn("routing_repaired_poincare_greedy_ns", data.timings)
+            self.assertIn("routing_coordinate_preparation_ns", data.timings)
+            self.assertIn("record_construction_ns", data.timings)
 
     def test_disposable_fixture_exercises_both_models_and_safety_paths(self):
         report = runner.run_development_fixture()
