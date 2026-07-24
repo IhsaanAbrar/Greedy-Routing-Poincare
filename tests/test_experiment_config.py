@@ -9,6 +9,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "code"))
 
 from experiment_config import (  # noqa: E402
+    APPROVED_EMBEDDING_DESIGN,
+    APPROVED_EMBEDDING_FAMILIES,
     BA_FINITE_DEGREE_MATCH_RULE,
     CONFIGURATIONS,
     CONFIGURATION_SCHEMA_VERSION,
@@ -17,10 +19,18 @@ from experiment_config import (  # noqa: E402
     DEVELOPMENT_CONFIG,
     ERDOS_RENYI,
     FULL_EXPERIMENT_CONFIG,
+    HYDRA_CONDITION_ID,
+    HYDRA_CURVATURE,
+    HYDRA_KAPPA,
     MAX_SEED,
+    MDS_BASE_EMBEDDING_ID,
+    MDS_CONDITION_IDS,
+    MDS_EUCLIDEAN_TOLERANCE_POLICY,
+    MDS_MAXIMUM_RADII,
     SEED_SPACE_SIZE,
     DegreeMatchedParameters,
     ExperimentConfig,
+    audit_feasibility_pilot_seed_collisions,
     audit_seed_collisions,
     derive_domain_seed,
     get_config,
@@ -41,6 +51,7 @@ class ExperimentConfigTests(unittest.TestCase):
         self.assertEqual(config.embedding_iterations, 100)
         self.assertEqual(config.development_embedding_radius, 0.85)
         self.assertEqual(config.spring_layout_iterations, 100)
+        self.assertIs(config.approved_embedding_design, APPROVED_EMBEDDING_DESIGN)
         self.assertFalse(config.is_provisional)
 
     def test_full_configuration_is_valid_and_marked_provisional(self):
@@ -53,6 +64,14 @@ class ExperimentConfigTests(unittest.TestCase):
         self.assertEqual(config.graph_replicate_count, 360)
         self.assertEqual(config.sampled_ordered_pair_count, 360_000)
         self.assertEqual(config.embedding_method, EMBEDDING_METHOD)
+        self.assertEqual(
+            config.approved_embedding_design.embedding_families,
+            APPROVED_EMBEDDING_FAMILIES,
+        )
+        self.assertEqual(
+            config.approved_embedding_design.coordinate_condition_ids,
+            (HYDRA_CONDITION_ID, *MDS_CONDITION_IDS),
+        )
         self.assertTrue(config.is_provisional)
         self.assertTrue(config.provisional_values)
 
@@ -160,6 +179,16 @@ class ExperimentConfigTests(unittest.TestCase):
                 self.assertEqual(audit_seed_collisions(config), ())
             combined_seeds.extend(use.seed for use in uses)
         self.assertEqual(len(combined_seeds), len(set(combined_seeds)))
+        self.assertEqual(
+            audit_feasibility_pilot_seed_collisions(FULL_EXPERIMENT_CONFIG),
+            (),
+        )
+        pilot_seeds = set(
+            FULL_EXPERIMENT_CONFIG
+            .approved_embedding_design
+            .feasibility_pilot_seeds
+        )
+        self.assertTrue(pilot_seeds.isdisjoint(combined_seeds))
 
     def test_every_graph_replicate_receives_different_seeds_in_each_stream(self):
         for config in (DEVELOPMENT_CONFIG, FULL_EXPERIMENT_CONFIG):
@@ -224,7 +253,46 @@ class ExperimentConfigTests(unittest.TestCase):
             snapshot["configuration_schema_version"],
             CONFIGURATION_SCHEMA_VERSION,
         )
-        self.assertEqual(snapshot["embedding"]["method"], EMBEDDING_METHOD)
+        force = snapshot["embedding"]["development_force_only"]
+        approved = snapshot["embedding"]["approved_design"]
+        self.assertEqual(force["method"], EMBEDDING_METHOD)
+        self.assertFalse(force["final_experiment_default"])
+        self.assertEqual(
+            approved["embedding_families"],
+            list(APPROVED_EMBEDDING_FAMILIES),
+        )
+        self.assertEqual(
+            approved["hydra"]["condition_id"],
+            HYDRA_CONDITION_ID,
+        )
+        self.assertEqual(approved["hydra"]["kappa"], HYDRA_KAPPA)
+        self.assertEqual(
+            approved["hydra"]["sectional_curvature"],
+            HYDRA_CURVATURE,
+        )
+        self.assertEqual(
+            approved["classical_mds"]["base_embedding_id"],
+            MDS_BASE_EMBEDDING_ID,
+        )
+        self.assertEqual(
+            approved["classical_mds"]["maximum_radii"],
+            list(MDS_MAXIMUM_RADII),
+        )
+        self.assertEqual(
+            approved["classical_mds"]["condition_ids"],
+            list(MDS_CONDITION_IDS),
+        )
+        self.assertEqual(
+            approved["classical_mds"][
+                "euclidean_routing_tolerance_policy"
+            ],
+            MDS_EUCLIDEAN_TOLERANCE_POLICY,
+        )
+        self.assertTrue(
+            approved["classical_mds"][
+                "radii_are_nested_sensitivity_transformations"
+            ]
+        )
         self.assertEqual(
             snapshot["parameter_settings"][0]["degree_match_rule"],
             BA_FINITE_DEGREE_MATCH_RULE,
@@ -242,15 +310,25 @@ class ExperimentConfigTests(unittest.TestCase):
         self.assertEqual(workload["erdos_renyi_graph_replicates"], 180)
         self.assertEqual(workload["barabasi_albert_graph_replicates"], 180)
         self.assertEqual(workload["sampled_ordered_pairs"], 360_000)
+        self.assertEqual(workload["independent_embedding_families"], 2)
+        self.assertEqual(workload["coordinate_conditions_per_graph"], 5)
+        self.assertEqual(workload["hydra_embedding_runs"], 360)
+        self.assertEqual(workload["mds_base_embedding_runs"], 360)
+        self.assertEqual(workload["independent_embedding_family_runs"], 720)
+        self.assertEqual(workload["mds_nested_radius_transformations"], 1_440)
         self.assertEqual(workload["dijkstra_routing_runs"], 360_000)
-        self.assertEqual(workload["euclidean_greedy_routing_runs"], 360_000)
-        self.assertEqual(workload["hyperbolic_greedy_routing_runs"], 360_000)
+        self.assertEqual(workload["euclidean_greedy_routing_runs"], 1_800_000)
+        self.assertEqual(workload["hyperbolic_greedy_routing_runs"], 1_800_000)
         self.assertEqual(
             workload["repaired_hyperbolic_greedy_routing_runs"],
-            360_000,
+            1_800_000,
         )
-        self.assertEqual(workload["routing_method_runs"], 1_440_000)
-        self.assertEqual(workload["distortion_unordered_pairs"], 65_916_000)
+        self.assertEqual(workload["routing_method_runs"], 5_760_000)
+        self.assertEqual(
+            workload["distortion_unordered_pairs_per_condition"],
+            65_916_000,
+        )
+        self.assertEqual(workload["distortion_unordered_pairs"], 329_580_000)
         self.assertEqual(
             workload["maximum_erdos_renyi_generation_attempts"],
             9_000,
@@ -311,6 +389,43 @@ class ExperimentConfigTests(unittest.TestCase):
                     self.assertRaises(ValueError),
                 ):
                     replace(DEVELOPMENT_CONFIG, **{field_name: value})
+
+        with self.assertRaises(ValueError):
+            replace(DEVELOPMENT_CONFIG, approved_embedding_design=None)
+
+    def test_invalid_approved_embedding_design_is_rejected(self):
+        design = APPROVED_EMBEDDING_DESIGN
+        invalid_changes = (
+            {"embedding_families": ("classical_mds", "hydra")},
+            {"hydra_dimension": 3},
+            {"hydra_kappa": 2.0},
+            {"hydra_curvature": -2.0},
+            {"hydra_centering_tolerance": 0.0},
+            {"hydra_centering_max_iterations": 0},
+            {"hydra_boundary_roundoff_tolerance": 0.1},
+            {"mds_dimension": 3},
+            {"mds_maximum_radii": (0.5, 0.7, 0.85, 0.9)},
+            {"mds_condition_ids": ("a", "b", "c", "d")},
+            {"mds_euclidean_tolerance_policy": "fixed_absolute"},
+            {"feasibility_pilot_seeds": (4_000_003, 4_000_003)},
+        )
+        for changes in invalid_changes:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                replace(design, **changes)
+
+    def test_approved_embedding_settings_affect_fingerprint(self):
+        changed_design = replace(
+            APPROVED_EMBEDDING_DESIGN,
+            hydra_centering_tolerance=2e-10,
+        )
+        changed_config = replace(
+            DEVELOPMENT_CONFIG,
+            approved_embedding_design=changed_design,
+        )
+        self.assertNotEqual(
+            changed_config.configuration_fingerprint,
+            DEVELOPMENT_CONFIG.configuration_fingerprint,
+        )
 
     def test_ordered_pair_request_cannot_exceed_available_pairs(self):
         # n=30 permits 30 * 29 = 870 ordered pairs.

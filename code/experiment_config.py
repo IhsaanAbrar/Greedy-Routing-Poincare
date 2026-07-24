@@ -18,7 +18,7 @@ MIN_SEED = 0
 MAX_SEED = 2**32 - 1
 SEED_SPACE_SIZE = MAX_SEED + 1
 
-CONFIGURATION_SCHEMA_VERSION = 2
+CONFIGURATION_SCHEMA_VERSION = 3
 SEED_DERIVATION_ALGORITHM = "blake2s-32-domain-separated-v1"
 GRAPH_GENERATION_SEED_DOMAIN = "graph_generation"
 EMBEDDING_INITIALIZATION_SEED_DOMAIN = "embedding_initialization"
@@ -31,7 +31,47 @@ BA_FINITE_DEGREE_MATCH_RULE = "p*(n-1) == 2*m*(n-m)/n"
 
 EMBEDDING_ALGORITHM = "fruchterman_reingold"
 EMBEDDING_METHOD = "dense_fruchterman_reingold_rescaled_v1"
-ROUTING_METHOD_COUNT = 4
+
+HYDRA_EMBEDDING_FAMILY = "hydra"
+MDS_EMBEDDING_FAMILY = "classical_mds"
+APPROVED_EMBEDDING_FAMILIES = (
+    HYDRA_EMBEDDING_FAMILY,
+    MDS_EMBEDDING_FAMILY,
+)
+HYDRA_CONDITION_ID = "hydra_2d_k1_frechet_centered_v1"
+MDS_BASE_EMBEDDING_ID = "classical_mds_2d_v1"
+MDS_MAXIMUM_RADII = (0.50, 0.70, 0.85, 0.95)
+MDS_CONDITION_IDS = ("mds_r050", "mds_r070", "mds_r085", "mds_r095")
+HYDRA_DIMENSION = 2
+HYDRA_KAPPA = 1.0
+HYDRA_CURVATURE = -1.0
+MDS_DIMENSION = 2
+HYDRA_CENTERING_TOLERANCE = 1e-10
+HYDRA_CENTERING_MAX_ITERATIONS = 256
+HYDRA_EIGENVALUE_TOLERANCE = 1e-12
+HYDRA_ISOMETRY_TOLERANCE = 1e-9
+HYDRA_BOUNDARY_ROUNDOFF_TOLERANCE = 1e-12
+MDS_EIGENVALUE_RELATIVE_TOLERANCE = 1e-12
+MDS_CENTROID_TOLERANCE = 1e-12
+MDS_EUCLIDEAN_TOLERANCE_POLICY = (
+    "scale_by_radius_over_maximum_approved_radius_v1"
+)
+FEASIBILITY_PILOT_SEEDS = (
+    4_000_003,
+    4_000_019,
+    4_000_037,
+    4_000_063,
+    4_000_099,
+    4_000_121,
+)
+
+COORDINATE_CONDITION_COUNT = 1 + len(MDS_CONDITION_IDS)
+COORDINATE_DEPENDENT_ROUTING_METHOD_COUNT = 3
+DIJKSTRA_RUNS_PER_PAIR = 1
+ROUTING_METHOD_COUNT = (
+    DIJKSTRA_RUNS_PER_PAIR
+    + COORDINATE_CONDITION_COUNT * COORDINATE_DEPENDENT_ROUTING_METHOD_COUNT
+)
 
 SeedIdentityPart: TypeAlias = str | int
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -266,6 +306,184 @@ class SeedCollision:
 
 
 @dataclass(frozen=True)
+class ApprovedEmbeddingDesign:
+    """Immutable Hydra/MDS coordinate conditions approved for the experiment."""
+
+    embedding_families: tuple[str, str]
+    hydra_condition_id: str
+    hydra_dimension: int
+    hydra_kappa: float
+    hydra_curvature: float
+    hydra_centering_tolerance: float
+    hydra_centering_max_iterations: int
+    hydra_eigenvalue_tolerance: float
+    hydra_isometry_tolerance: float
+    hydra_boundary_roundoff_tolerance: float
+    mds_base_embedding_id: str
+    mds_dimension: int
+    mds_maximum_radii: tuple[float, float, float, float]
+    mds_condition_ids: tuple[str, str, str, str]
+    mds_eigenvalue_relative_tolerance: float
+    mds_centroid_tolerance: float
+    mds_euclidean_tolerance_policy: str
+    feasibility_pilot_seeds: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "embedding_families", tuple(self.embedding_families))
+        object.__setattr__(
+            self, "mds_maximum_radii", tuple(self.mds_maximum_radii)
+        )
+        object.__setattr__(self, "mds_condition_ids", tuple(self.mds_condition_ids))
+        object.__setattr__(
+            self, "feasibility_pilot_seeds", tuple(self.feasibility_pilot_seeds)
+        )
+        if self.embedding_families != APPROVED_EMBEDDING_FAMILIES:
+            raise ValueError(
+                f"embedding_families must equal {APPROVED_EMBEDDING_FAMILIES}"
+            )
+        if self.hydra_condition_id != HYDRA_CONDITION_ID:
+            raise ValueError(f"hydra_condition_id must be {HYDRA_CONDITION_ID!r}")
+        if self.hydra_dimension != HYDRA_DIMENSION:
+            raise ValueError("hydra_dimension must equal 2")
+        if self.hydra_kappa != HYDRA_KAPPA or self.hydra_curvature != HYDRA_CURVATURE:
+            raise ValueError(
+                "Hydra must use kappa=1 under the sectional-curvature -1 convention"
+            )
+        for name, value in (
+            ("hydra_centering_tolerance", self.hydra_centering_tolerance),
+            ("hydra_eigenvalue_tolerance", self.hydra_eigenvalue_tolerance),
+            ("hydra_isometry_tolerance", self.hydra_isometry_tolerance),
+            (
+                "hydra_boundary_roundoff_tolerance",
+                self.hydra_boundary_roundoff_tolerance,
+            ),
+            (
+                "mds_eigenvalue_relative_tolerance",
+                self.mds_eigenvalue_relative_tolerance,
+            ),
+            ("mds_centroid_tolerance", self.mds_centroid_tolerance),
+        ):
+            _require_positive_finite(name, value)
+        if self.hydra_boundary_roundoff_tolerance > 1e-10:
+            raise ValueError(
+                "hydra_boundary_roundoff_tolerance must remain roundoff-scale"
+            )
+        _require_positive_int(
+            "hydra_centering_max_iterations",
+            self.hydra_centering_max_iterations,
+        )
+        if self.mds_base_embedding_id != MDS_BASE_EMBEDDING_ID:
+            raise ValueError(
+                f"mds_base_embedding_id must be {MDS_BASE_EMBEDDING_ID!r}"
+            )
+        if self.mds_dimension != MDS_DIMENSION:
+            raise ValueError("mds_dimension must equal 2")
+        if self.mds_maximum_radii != MDS_MAXIMUM_RADII:
+            raise ValueError(
+                f"mds_maximum_radii must equal {MDS_MAXIMUM_RADII}"
+            )
+        if self.mds_condition_ids != MDS_CONDITION_IDS:
+            raise ValueError(
+                f"mds_condition_ids must equal {MDS_CONDITION_IDS}"
+            )
+        if (
+            self.mds_euclidean_tolerance_policy
+            != MDS_EUCLIDEAN_TOLERANCE_POLICY
+        ):
+            raise ValueError(
+                "mds_euclidean_tolerance_policy must use the approved "
+                "scale-equivariant rule"
+            )
+        if len(set(self.mds_condition_ids)) != len(self.mds_condition_ids):
+            raise ValueError("mds_condition_ids must be unique")
+        if len(self.feasibility_pilot_seeds) < 2:
+            raise ValueError("at least two feasibility_pilot_seeds are required")
+        for seed in self.feasibility_pilot_seeds:
+            _validate_seed("feasibility_pilot_seed", seed)
+        if len(set(self.feasibility_pilot_seeds)) != len(
+            self.feasibility_pilot_seeds
+        ):
+            raise ValueError("feasibility_pilot_seeds must be unique")
+
+    @property
+    def coordinate_condition_ids(self) -> tuple[str, ...]:
+        return (self.hydra_condition_id, *self.mds_condition_ids)
+
+    @property
+    def independent_embedding_family_count(self) -> int:
+        return len(self.embedding_families)
+
+    @property
+    def coordinate_condition_count(self) -> int:
+        return len(self.coordinate_condition_ids)
+
+    def as_dict(self) -> dict[str, JsonValue]:
+        return {
+            "embedding_families": list(self.embedding_families),
+            "independent_embedding_family_count": (
+                self.independent_embedding_family_count
+            ),
+            "coordinate_condition_count": self.coordinate_condition_count,
+            "coordinate_condition_ids": list(self.coordinate_condition_ids),
+            "hydra": {
+                "condition_id": self.hydra_condition_id,
+                "dimension": self.hydra_dimension,
+                "kappa": self.hydra_kappa,
+                "sectional_curvature": self.hydra_curvature,
+                "centering": "unweighted_hyperbolic_frechet_mean_to_origin",
+                "centering_tolerance": self.hydra_centering_tolerance,
+                "centering_max_iterations": self.hydra_centering_max_iterations,
+                "eigenvalue_tolerance": self.hydra_eigenvalue_tolerance,
+                "isometry_tolerance": self.hydra_isometry_tolerance,
+                "boundary_roundoff_tolerance": (
+                    self.hydra_boundary_roundoff_tolerance
+                ),
+                "post_centering_radial_rescaling": False,
+            },
+            "classical_mds": {
+                "base_embedding_id": self.mds_base_embedding_id,
+                "dimension": self.mds_dimension,
+                "maximum_radii": list(self.mds_maximum_radii),
+                "condition_ids": list(self.mds_condition_ids),
+                "radii_are_nested_sensitivity_transformations": True,
+                "eigenvalue_relative_tolerance": (
+                    self.mds_eigenvalue_relative_tolerance
+                ),
+                "centroid_tolerance": self.mds_centroid_tolerance,
+                "euclidean_routing_tolerance_policy": (
+                    self.mds_euclidean_tolerance_policy
+                ),
+            },
+            "feasibility_pilot": {
+                "excluded_from_final_experiment": True,
+                "reserved_seeds": list(self.feasibility_pilot_seeds),
+            },
+        }
+
+
+APPROVED_EMBEDDING_DESIGN = ApprovedEmbeddingDesign(
+    embedding_families=APPROVED_EMBEDDING_FAMILIES,
+    hydra_condition_id=HYDRA_CONDITION_ID,
+    hydra_dimension=HYDRA_DIMENSION,
+    hydra_kappa=HYDRA_KAPPA,
+    hydra_curvature=HYDRA_CURVATURE,
+    hydra_centering_tolerance=HYDRA_CENTERING_TOLERANCE,
+    hydra_centering_max_iterations=HYDRA_CENTERING_MAX_ITERATIONS,
+    hydra_eigenvalue_tolerance=HYDRA_EIGENVALUE_TOLERANCE,
+    hydra_isometry_tolerance=HYDRA_ISOMETRY_TOLERANCE,
+    hydra_boundary_roundoff_tolerance=HYDRA_BOUNDARY_ROUNDOFF_TOLERANCE,
+    mds_base_embedding_id=MDS_BASE_EMBEDDING_ID,
+    mds_dimension=MDS_DIMENSION,
+    mds_maximum_radii=MDS_MAXIMUM_RADII,
+    mds_condition_ids=MDS_CONDITION_IDS,
+    mds_eigenvalue_relative_tolerance=MDS_EIGENVALUE_RELATIVE_TOLERANCE,
+    mds_centroid_tolerance=MDS_CENTROID_TOLERANCE,
+    mds_euclidean_tolerance_policy=MDS_EUCLIDEAN_TOLERANCE_POLICY,
+    feasibility_pilot_seeds=FEASIBILITY_PILOT_SEEDS,
+)
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     name: str
     parameter_settings: tuple[DegreeMatchedParameters, ...]
@@ -280,6 +498,7 @@ class ExperimentConfig:
     embedding_method: str
     embedding_radius: float
     embedding_iterations: int
+    approved_embedding_design: ApprovedEmbeddingDesign
     expected_degree_match_tolerance: float
     max_connected_graph_generation_attempts: int
     routing_tie_break_rule: str
@@ -356,6 +575,18 @@ class ExperimentConfig:
         _require_positive_int(
             "embedding_iterations", self.embedding_iterations
         )
+        if not isinstance(
+            self.approved_embedding_design, ApprovedEmbeddingDesign
+        ):
+            raise ValueError(
+                "approved_embedding_design must be an ApprovedEmbeddingDesign"
+            )
+        if set(self.approved_embedding_design.feasibility_pilot_seeds) & set(
+            master_seeds
+        ):
+            raise ValueError(
+                "feasibility-pilot seeds must not equal experiment master seeds"
+            )
         _require_positive_finite(
             "expected_degree_match_tolerance",
             self.expected_degree_match_tolerance,
@@ -486,7 +717,7 @@ class ExperimentConfig:
     def workload_estimate(self) -> dict[str, int]:
         er_graphs = len(self.parameter_settings) * self.graph_repetitions
         ba_graphs = er_graphs
-        distortion_pairs = sum(
+        distortion_pairs_per_condition = sum(
             len(GRAPH_MODELS)
             * self.graph_repetitions
             * setting.n
@@ -496,21 +727,54 @@ class ExperimentConfig:
         )
         return {
             "graph_replicates": self.graph_replicate_count,
+            "independent_graph_replicates": self.graph_replicate_count,
             "erdos_renyi_graph_replicates": er_graphs,
             "barabasi_albert_graph_replicates": ba_graphs,
-            "embedding_runs": self.graph_replicate_count,
+            "independent_embedding_families": (
+                self.approved_embedding_design.independent_embedding_family_count
+            ),
+            "coordinate_conditions_per_graph": (
+                self.approved_embedding_design.coordinate_condition_count
+            ),
+            "hydra_embedding_runs": self.graph_replicate_count,
+            "mds_base_embedding_runs": self.graph_replicate_count,
+            "independent_embedding_family_runs": (
+                self.graph_replicate_count
+                * self.approved_embedding_design.independent_embedding_family_count
+            ),
+            "mds_nested_radius_transformations": (
+                self.graph_replicate_count
+                * len(self.approved_embedding_design.mds_maximum_radii)
+            ),
+            "embedding_runs": (
+                self.graph_replicate_count
+                * self.approved_embedding_design.independent_embedding_family_count
+            ),
             "sampled_ordered_pairs": self.sampled_ordered_pair_count,
             "routing_methods_per_pair": ROUTING_METHOD_COUNT,
             "dijkstra_routing_runs": self.sampled_ordered_pair_count,
-            "euclidean_greedy_routing_runs": self.sampled_ordered_pair_count,
-            "hyperbolic_greedy_routing_runs": self.sampled_ordered_pair_count,
+            "euclidean_greedy_routing_runs": (
+                self.sampled_ordered_pair_count
+                * self.approved_embedding_design.coordinate_condition_count
+            ),
+            "hyperbolic_greedy_routing_runs": (
+                self.sampled_ordered_pair_count
+                * self.approved_embedding_design.coordinate_condition_count
+            ),
             "repaired_hyperbolic_greedy_routing_runs": (
                 self.sampled_ordered_pair_count
+                * self.approved_embedding_design.coordinate_condition_count
             ),
             "routing_method_runs": (
                 self.sampled_ordered_pair_count * ROUTING_METHOD_COUNT
             ),
-            "distortion_unordered_pairs": distortion_pairs,
+            "distortion_unordered_pairs_per_condition": (
+                distortion_pairs_per_condition
+            ),
+            "distortion_unordered_pairs": (
+                distortion_pairs_per_condition
+                * self.approved_embedding_design.coordinate_condition_count
+            ),
             "maximum_erdos_renyi_generation_attempts": (
                 er_graphs * self.max_connected_graph_generation_attempts
             ),
@@ -546,10 +810,14 @@ class ExperimentConfig:
             "unit_disk_boundary_epsilon": self.unit_disk_boundary_epsilon,
             "numerical_tolerance": self.numerical_tolerance,
             "embedding": {
-                "algorithm": self.embedding_algorithm,
-                "method": self.embedding_method,
-                "radius": self.embedding_radius,
-                "iterations": self.embedding_iterations,
+                "approved_design": self.approved_embedding_design.as_dict(),
+                "development_force_only": {
+                    "algorithm": self.embedding_algorithm,
+                    "method": self.embedding_method,
+                    "radius": self.embedding_radius,
+                    "iterations": self.embedding_iterations,
+                    "final_experiment_default": False,
+                },
             },
             "expected_degree_match_tolerance": (
                 self.expected_degree_match_tolerance
@@ -751,6 +1019,21 @@ def audit_seed_collisions(config: ExperimentConfig) -> tuple[SeedCollision, ...]
     )
 
 
+def audit_feasibility_pilot_seed_collisions(
+    config: ExperimentConfig,
+) -> tuple[int, ...]:
+    """Return reserved pilot seeds reused by any configured experiment stream."""
+
+    if not isinstance(config, ExperimentConfig):
+        raise ValueError("config must be an ExperimentConfig")
+    configured_seeds = {use.seed for use in iter_seed_uses(config)}
+    return tuple(
+        seed
+        for seed in config.approved_embedding_design.feasibility_pilot_seeds
+        if seed in configured_seeds
+    )
+
+
 DEVELOPMENT_CONFIG = ExperimentConfig(
     name="development",
     parameter_settings=tuple(
@@ -773,14 +1056,17 @@ DEVELOPMENT_CONFIG = ExperimentConfig(
     embedding_method=EMBEDDING_METHOD,
     embedding_radius=0.85,
     embedding_iterations=100,
+    approved_embedding_design=APPROVED_EMBEDDING_DESIGN,
     expected_degree_match_tolerance=1e-12,
     max_connected_graph_generation_attempts=25,
     routing_tie_break_rule=SMALLEST_NODE_ID,
     routing_tie_break_description=TIE_BREAK_DESCRIPTION,
     is_provisional=False,
     workload_note=(
-        "Debug-only settings: 8 graph replicates, 200 sampled ordered pairs, "
-        "and 800 routing-method runs across those graphs."
+        "Debug-only settings: 8 independent graph replicates and 200 sampled "
+        "ordered pairs. Approved-design workload counts Hydra and one base MDS "
+        "embedding per graph, four nested MDS transformations, Dijkstra once "
+        "per pair, and three greedy methods under five coordinate conditions."
     ),
 )
 
@@ -808,6 +1094,7 @@ FULL_EXPERIMENT_CONFIG = ExperimentConfig(
     embedding_method=EMBEDDING_METHOD,
     embedding_radius=0.85,
     embedding_iterations=200,
+    approved_embedding_design=APPROVED_EMBEDDING_DESIGN,
     expected_degree_match_tolerance=1e-12,
     max_connected_graph_generation_attempts=50,
     routing_tie_break_rule=SMALLEST_NODE_ID,
@@ -821,16 +1108,16 @@ FULL_EXPERIMENT_CONFIG = ExperimentConfig(
         "source-destination pairs per graph",
         "master seeds",
         "unit-disk boundary epsilon",
-        "embedding method, radius, and iterations",
         "numerical and expected-degree tolerances",
         "connected-graph generation attempt limit",
         "routing tie-breaking rule",
     ),
     workload_note=(
         "Provisional paper workload: 360 graph replicates and 360,000 sampled "
-        "ordered pairs per routing method/benchmark, producing 1,440,000 "
-        "routing-method runs and 65,916,000 distortion pairs. Runtime and "
-        "memory must be benchmarked before these values are frozen."
+        "ordered pairs. MDS radii are nested transformations, not graph "
+        "replicates. Dijkstra runs once per pair and each of three greedy "
+        "methods runs under five coordinate conditions. Runtime and memory "
+        "must be benchmarked before graph-grid values are frozen."
     ),
 )
 
@@ -841,6 +1128,11 @@ CONFIGURATIONS = MappingProxyType(
         FULL_EXPERIMENT_CONFIG.name: FULL_EXPERIMENT_CONFIG,
     }
 )
+
+if audit_feasibility_pilot_seed_collisions(FULL_EXPERIMENT_CONFIG):
+    raise RuntimeError(
+        "reserved feasibility-pilot seeds collide with final experiment seeds"
+    )
 
 
 def get_config(name: str) -> ExperimentConfig:

@@ -1,9 +1,11 @@
-"""Deterministic development embedding and embedding-quality measurements."""
+"""Shared embedding inputs, validation, and development embedding utilities."""
 
 from __future__ import annotations
 
 from collections.abc import Hashable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
+import json
 from math import hypot, isfinite, sqrt
 from numbers import Integral
 
@@ -29,6 +31,96 @@ MAX_RANDOM_SEED = 2**32 - 1
 DEVELOPMENT_EMBEDDING_ID = "dense_fruchterman_reingold_rescaled_v1"
 FORCE_LAYOUT_IMPLEMENTATION = "project_dense_fruchterman_reingold_v1"
 FORCE_CONVERGENCE_THRESHOLD = 1e-4
+EMBEDDING_NODE_LABEL_CONTRACT = (
+    "homogeneous_non_boolean_integers_or_homogeneous_strings_v1"
+)
+FINAL_EXPERIMENT_NODE_LABEL_CONTRACT = (
+    "non_boolean_integer_ids_zero_through_n_minus_one_v1"
+)
+
+
+def _validate_supported_node_labels(nodes: tuple[Hashable, ...]) -> str:
+    """Return the stable label kind or reject labels with unstable identities."""
+
+    if all(
+        isinstance(node, Integral) and not isinstance(node, bool)
+        for node in nodes
+    ):
+        return "integer"
+    if all(isinstance(node, str) for node in nodes):
+        return "string"
+    raise ValueError(
+        "node labels must be homogeneous non-boolean integers or homogeneous "
+        "strings; mixed labels and custom objects are unsupported"
+    )
+
+
+@dataclass(frozen=True, eq=False)
+class EmbeddingInput:
+    """One immutable ordered graph-distance matrix shared by embedding families."""
+
+    node_order: tuple[Hashable, ...]
+    distance_matrix: NDArray[np.float64] = field(repr=False)
+    configuration_fingerprint: str
+    input_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.node_order, tuple) or not self.node_order:
+            raise ValueError("EmbeddingInput.node_order must be a non-empty tuple")
+        _validate_supported_node_labels(self.node_order)
+        try:
+            if len(set(self.node_order)) != len(self.node_order):
+                raise ValueError("EmbeddingInput.node_order values must be unique")
+        except TypeError as exc:
+            raise ValueError(
+                "EmbeddingInput.node_order values must be hashable"
+            ) from exc
+        if not isinstance(self.distance_matrix, np.ndarray):
+            raise ValueError("EmbeddingInput.distance_matrix must be a NumPy array")
+        if (
+            self.distance_matrix.dtype != np.dtype(np.float64)
+            or self.distance_matrix.ndim != 2
+            or self.distance_matrix.shape
+            != (len(self.node_order), len(self.node_order))
+        ):
+            raise ValueError(
+                "EmbeddingInput.distance_matrix must be a matching float64 square matrix"
+            )
+        if (
+            not np.isfinite(self.distance_matrix).all()
+            or np.any(self.distance_matrix < 0.0)
+            or not np.array_equal(
+                self.distance_matrix,
+                self.distance_matrix.T,
+            )
+            or not np.array_equal(
+                np.diag(self.distance_matrix),
+                np.zeros(len(self.node_order), dtype=np.float64),
+            )
+        ):
+            raise ValueError(
+                "EmbeddingInput.distance_matrix must retain validated distance invariants"
+            )
+        if self.distance_matrix.flags.writeable:
+            raise ValueError("EmbeddingInput.distance_matrix must be read-only")
+        if (
+            not isinstance(self.configuration_fingerprint, str)
+            or not self.configuration_fingerprint
+        ):
+            raise ValueError(
+                "EmbeddingInput.configuration_fingerprint must be a non-empty string"
+            )
+        if (
+            not isinstance(self.input_fingerprint, str)
+            or len(self.input_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.input_fingerprint
+            )
+        ):
+            raise ValueError(
+                "EmbeddingInput.input_fingerprint must be a lowercase SHA-256 digest"
+            )
 
 
 def development_embedding_metadata() -> dict[str, str | float]:
@@ -118,6 +210,245 @@ def _as_finite_point(point: ArrayLike, *, name: str) -> NDArray[np.float64]:
     return np.array(array, dtype=float, copy=True)
 
 
+def _canonicalize_vector_sign(
+    vector: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    result = np.array(vector, dtype=np.float64, copy=True)
+    pivot = int(np.argmax(np.abs(result)))
+    if result[pivot] < 0.0:
+        result *= -1.0
+    return result
+
+
+def canonical_eigenvectors_for_indices(
+    eigenvalues: NDArray[np.float64],
+    eigenvectors: NDArray[np.float64],
+    selected_indices: tuple[int, ...],
+    *,
+    relative_tolerance: float,
+) -> tuple[tuple[NDArray[np.float64], ...], tuple[int, ...]]:
+    """Return deterministic vectors even when selected eigenvalues repeat.
+
+    Eigenvectors from a symmetric eigensolver are sign-ambiguous, and an
+    orthonormal basis of a repeated eigenspace is rotation-ambiguous. Values
+    within ``relative_tolerance * max(1, max(abs(eigenvalues)))`` are treated
+    as one numerical eigenspace. Its basis is then reconstructed by projecting
+    stable standard node axes and applying deterministic reorthogonalisation.
+    Only vectors needed by ``selected_indices`` are constructed.
+    """
+
+    tolerance = _require_positive_finite(
+        "relative_tolerance",
+        relative_tolerance,
+    )
+    values = np.asarray(eigenvalues, dtype=np.float64)
+    vectors = np.asarray(eigenvectors, dtype=np.float64)
+    if (
+        values.ndim != 1
+        or vectors.ndim != 2
+        or vectors.shape != (len(values), len(values))
+        or not np.isfinite(values).all()
+        or not np.isfinite(vectors).all()
+    ):
+        raise ValueError("eigenvalues and eigenvectors have invalid shapes or values")
+    indices = tuple(selected_indices)
+    if (
+        not indices
+        or len(set(indices)) != len(indices)
+        or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(values)
+            for index in indices
+        )
+    ):
+        raise ValueError("selected_indices must contain unique valid integers")
+    scale = max(1.0, float(np.max(np.abs(values))))
+    grouping_threshold = tolerance * scale
+    if np.any(values[:-1] < values[1:] - grouping_threshold):
+        raise ValueError("eigenvalues must be sorted in non-increasing order")
+
+    vector_by_index: dict[int, NDArray[np.float64]] = {}
+    selected_group_sizes: list[int] = []
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while (
+            end < len(values)
+            and float(values[start] - values[end]) <= grouping_threshold
+        ):
+            end += 1
+        selected_in_group = tuple(
+            index for index in indices if start <= index < end
+        )
+        if not selected_in_group:
+            start = end
+            continue
+        group_size = end - start
+        if group_size == 1:
+            vector_by_index[selected_in_group[0]] = _canonicalize_vector_sign(
+                vectors[:, start]
+            )
+            start = end
+            continue
+
+        selected_group_sizes.append(group_size)
+        group_vectors = vectors[:, start:end]
+        basis: list[NDArray[np.float64]] = []
+        basis_threshold = max(
+            tolerance,
+            64.0 * np.finfo(np.float64).eps * len(values),
+        )
+        for axis in range(len(values)):
+            candidate = group_vectors @ group_vectors[axis, :]
+            for _ in range(2):
+                for previous in basis:
+                    candidate -= float(np.dot(previous, candidate)) * previous
+            norm = float(np.linalg.norm(candidate))
+            if norm <= basis_threshold:
+                continue
+            candidate /= norm
+            if candidate[axis] < 0.0:
+                candidate *= -1.0
+            basis.append(candidate)
+            if len(basis) == len(selected_in_group):
+                break
+        if len(basis) != len(selected_in_group):
+            raise RuntimeError(
+                "could not construct a deterministic repeated-eigenspace basis"
+            )
+        for index, vector in zip(selected_in_group, basis, strict=True):
+            vector_by_index[index] = vector
+        start = end
+
+    return (
+        tuple(vector_by_index[index] for index in indices),
+        tuple(selected_group_sizes),
+    )
+
+
+def validate_distance_matrix(
+    distance_matrix: ArrayLike,
+    *,
+    tolerance: float = DEFAULT_NUMERICAL_TOLERANCE,
+) -> NDArray[np.float64]:
+    """Validate and return a symmetric float64 copy of a distance matrix.
+
+    Symmetry and the zero diagonal are checked within ``tolerance``. Values
+    must otherwise be finite and non-negative. A matrix that passes the
+    symmetry check is averaged with its transpose only to remove roundoff-level
+    asymmetry before symmetric eigendecomposition.
+    """
+
+    validated_tolerance = _require_positive_finite("tolerance", tolerance)
+    try:
+        matrix = np.asarray(distance_matrix, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("distance_matrix must be a finite square numeric matrix") from exc
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("distance_matrix must be square")
+    if matrix.shape[0] < 2:
+        raise ValueError("distance_matrix must contain at least two points")
+    if not np.isfinite(matrix).all():
+        raise ValueError(
+            "distance_matrix must contain only finite connected-pair distances"
+        )
+    if np.any(matrix < 0.0):
+        raise ValueError("distance_matrix distances must be non-negative")
+    if not np.allclose(
+        matrix,
+        matrix.T,
+        rtol=0.0,
+        atol=validated_tolerance,
+    ):
+        raise ValueError(
+            "distance_matrix must be symmetric within the configured tolerance"
+        )
+    if not np.allclose(
+        np.diag(matrix),
+        0.0,
+        rtol=0.0,
+        atol=validated_tolerance,
+    ):
+        raise ValueError(
+            "distance_matrix diagonal must be zero within the configured tolerance"
+        )
+
+    validated = np.array((matrix + matrix.T) * 0.5, dtype=np.float64, copy=True)
+    np.fill_diagonal(validated, 0.0)
+    return validated
+
+
+def _node_fingerprint_identity(node: Hashable) -> tuple[str, str]:
+    if isinstance(node, Integral) and not isinstance(node, bool):
+        return ("integer", str(int(node)))
+    if isinstance(node, str):
+        return ("string", node)
+    raise ValueError("unsupported node label reached fingerprint serialization")
+
+
+def embedding_input_from_distance_matrix(
+    distance_matrix: ArrayLike,
+    node_order: tuple[Hashable, ...] | list[Hashable],
+    *,
+    configuration_fingerprint: str,
+    tolerance: float = DEFAULT_NUMERICAL_TOLERANCE,
+) -> EmbeddingInput:
+    """Build an immutable, fingerprinted input shared by Hydra and MDS.
+
+    Low-level mathematical fixtures may use homogeneous string labels. The
+    approved experiment uses only non-boolean integer IDs; mixed labels and
+    custom object labels are rejected before a fingerprint can be produced.
+    """
+
+    if not isinstance(configuration_fingerprint, str) or not configuration_fingerprint:
+        raise ValueError("configuration_fingerprint must be a non-empty string")
+    ordered_nodes = tuple(node_order)
+    if not ordered_nodes:
+        raise ValueError("node_order must not be empty")
+    _validate_supported_node_labels(ordered_nodes)
+    try:
+        unique_nodes = set(ordered_nodes)
+    except TypeError as exc:
+        raise ValueError("node_order values must be hashable") from exc
+    if len(unique_nodes) != len(ordered_nodes):
+        raise ValueError("node_order values must be unique")
+
+    validated = validate_distance_matrix(distance_matrix, tolerance=tolerance)
+    if validated.shape[0] != len(ordered_nodes):
+        raise ValueError(
+            "node_order length must match the distance_matrix dimension"
+        )
+    canonical_nodes = [
+        _node_fingerprint_identity(node) for node in ordered_nodes
+    ]
+    digest = sha256()
+    digest.update(b"greedy-routing-embedding-input-v2\0")
+    digest.update(EMBEDDING_NODE_LABEL_CONTRACT.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(configuration_fingerprint.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(
+        json.dumps(
+            canonical_nodes,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+    )
+    digest.update(b"\0")
+    canonical_matrix = np.asarray(validated, dtype="<f8", order="C")
+    digest.update(str(canonical_matrix.shape).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(canonical_matrix.tobytes(order="C"))
+    validated.setflags(write=False)
+    return EmbeddingInput(
+        node_order=ordered_nodes,
+        distance_matrix=validated,
+        configuration_fingerprint=configuration_fingerprint,
+        input_fingerprint=digest.hexdigest(),
+    )
+
+
 def _validate_undirected_graph(graph: nx.Graph) -> None:
     if not isinstance(graph, nx.Graph):
         raise ValueError("graph must be a NetworkX graph")
@@ -129,19 +460,44 @@ def _validate_undirected_graph(graph: nx.Graph) -> None:
 
 def _stable_node_order(graph: nx.Graph) -> tuple[Hashable, ...]:
     nodes = tuple(graph.nodes())
-    if all(isinstance(node, Integral) and not isinstance(node, bool) for node in nodes):
+    label_kind = _validate_supported_node_labels(nodes)
+    if label_kind == "integer":
         return tuple(sorted(nodes))
-    if all(isinstance(node, str) for node in nodes):
+    if label_kind == "string":
         return tuple(sorted(nodes))
-    return tuple(
-        sorted(
-            nodes,
-            key=lambda node: (
-                type(node).__module__,
-                type(node).__qualname__,
-                repr(node),
-            ),
-        )
+    raise RuntimeError("validated node-label kind is unsupported")
+
+
+def stable_node_order(graph: nx.Graph) -> tuple[Hashable, ...]:
+    """Return the public deterministic node ordering used by every embedding."""
+
+    _validate_undirected_graph(graph)
+    return _stable_node_order(graph)
+
+
+def prepare_embedding_input(
+    graph: nx.Graph,
+    shortest_paths: AllPairsShortestPathData,
+    *,
+    configuration_fingerprint: str,
+    tolerance: float = DEFAULT_NUMERICAL_TOLERANCE,
+) -> EmbeddingInput:
+    """Construct one reusable matrix from already-computed shortest paths."""
+
+    path_data = validate_shortest_path_data(graph, shortest_paths)
+    ordered_nodes = stable_node_order(graph)
+    matrix = np.asarray(
+        [
+            [path_data.distances[source][target] for target in ordered_nodes]
+            for source in ordered_nodes
+        ],
+        dtype=np.float64,
+    )
+    return embedding_input_from_distance_matrix(
+        matrix,
+        ordered_nodes,
+        configuration_fingerprint=configuration_fingerprint,
+        tolerance=tolerance,
     )
 
 
@@ -351,16 +707,6 @@ def calculate_embedding_distortion(
         node: validate_disk_point(coordinates[node], name=f"coordinate[{node!r}]")
         for node in ordered_nodes
     }
-    coordinate_owners: dict[tuple[float, float], Hashable] = {}
-    for node, coordinate in validated_coordinates.items():
-        coordinate_key = (float(coordinate[0]), float(coordinate[1]))
-        if coordinate_key in coordinate_owners:
-            other = coordinate_owners[coordinate_key]
-            raise ValueError(
-                "distinct graph nodes must not have duplicate coordinates "
-                f"({other!r} and {node!r})"
-            )
-        coordinate_owners[coordinate_key] = node
     shortest_path_lengths = path_data.distances
 
     ratios: list[float] = []

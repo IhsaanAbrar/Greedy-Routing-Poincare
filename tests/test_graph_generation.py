@@ -73,7 +73,19 @@ class GraphGenerationTests(unittest.TestCase):
             CONFIGURATION_SCHEMA_VERSION,
         )
         self.assertEqual(generated.metadata["setting_label"], "dev_n30_m2")
-        self.assertEqual(generated.metadata["embedding_method"], EMBEDDING_METHOD)
+        self.assertEqual(
+            generated.metadata["development_force_embedding_method"],
+            EMBEDDING_METHOD,
+        )
+        self.assertEqual(
+            generated.metadata["approved_embedding_families"],
+            "hydra,classical_mds",
+        )
+        self.assertEqual(
+            generated.metadata["coordinate_condition_ids"],
+            "hydra_2d_k1_frechet_centered_v1,"
+            "mds_r050,mds_r070,mds_r085,mds_r095",
+        )
         self.assertEqual(
             generated.metadata["erdos_renyi_sampling"],
             "G(n,p) conditioned on connectedness",

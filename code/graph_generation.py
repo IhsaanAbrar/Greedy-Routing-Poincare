@@ -356,10 +356,20 @@ def generate_graph(
             ),
             "unit_disk_boundary_epsilon": config.unit_disk_boundary_epsilon,
             "numerical_tolerance": config.numerical_tolerance,
-            "embedding_algorithm": config.embedding_algorithm,
-            "embedding_method": config.embedding_method,
-            "embedding_radius": config.embedding_radius,
-            "embedding_iterations": config.embedding_iterations,
+            "approved_embedding_families": ",".join(
+                config.approved_embedding_design.embedding_families
+            ),
+            "coordinate_condition_ids": ",".join(
+                config.approved_embedding_design.coordinate_condition_ids
+            ),
+            "mds_maximum_radii": ",".join(
+                format(radius, ".2f")
+                for radius in config.approved_embedding_design.mds_maximum_radii
+            ),
+            "development_force_embedding_algorithm": config.embedding_algorithm,
+            "development_force_embedding_method": config.embedding_method,
+            "development_force_embedding_radius": config.embedding_radius,
+            "development_force_embedding_iterations": config.embedding_iterations,
             "routing_tie_break_rule": config.routing_tie_break_rule,
             "networkx_version": nx.__version__,
             "python_version": platform.python_version(),

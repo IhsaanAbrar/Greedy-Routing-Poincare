@@ -357,12 +357,16 @@ class EmbeddingDistortionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             calculate_embedding_distortion(self.graph, coordinates)
 
-    def test_any_duplicate_coordinates_are_rejected(self):
+    def test_some_coincident_coordinates_are_accepted(self):
         coordinates = dict(self.coordinates)
         coordinates[4] = coordinates[0].copy()
 
-        with self.assertRaisesRegex(ValueError, "duplicate coordinates"):
-            calculate_embedding_distortion(self.graph, coordinates)
+        result = calculate_embedding_distortion(self.graph, coordinates)
+
+        self.assertEqual(result.unordered_pair_count, 10)
+        self.assertTrue(isfinite(result.fitted_scale_alpha))
+        self.assertTrue(isfinite(result.mean_relative_distortion))
+        self.assertTrue(isfinite(result.rmse_relative_distortion))
 
     def test_single_node_and_invalid_tolerance_are_rejected(self):
         with self.assertRaises(ValueError):

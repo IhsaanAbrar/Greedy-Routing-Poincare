@@ -10,13 +10,14 @@ tie-breaking so that the routing methods are compared on the same inputs.
 
 Development Stages 1-11 are implemented: validated experiment settings,
 distance and disk utilities, connected ER and BA generation, network metrics,
-a provisional development embedding, embedding distortion, Dijkstra and all
-three routing variants, deterministic pair sampling, and a small integration
-smoke runner.
+embedding distortion, Dijkstra and all three routing variants, deterministic
+pair sampling, and a small integration smoke runner. The approved co-equal
+embeddings are deterministic standard two-dimensional Hydra at curvature -1
+and classical two-dimensional MDS.
 
-The smoke run is pipeline validation only. It is not the full experiment, does
-not produce paper results, and must not be used to claim that one routing metric
-is superior.
+The development smoke and embedding-feasibility pilot are pipeline validation
+only. They are excluded from the full experiment, produce no scientific
+results, and must not be used to claim that one routing metric is superior.
 
 ## Methods
 
@@ -25,14 +26,20 @@ is superior.
 - Hyperbolic greedy routing: the same local rule using Poincare distance.
 - Repaired hyperbolic routing: one route-history-based backtracking repair.
 
-Both greedy metrics use exactly the same coordinate mapping. The current
-development coordinates come from the project's deterministic dense
-Fruchterman-Reingold force layout, using NumPy and a NetworkX adjacency matrix,
-then centring and uniform rescaling into the unit disk. This is not a canonical
-hyperbolic embedding. Its versioned identifier is
-`dense_fruchterman_reingold_rescaled_v1`. Because the layout is Euclidean and
-force-directed, it may favour Euclidean routing. It is suitable for pipeline
-validation, but the final scientific embedding still requires approval.
+Each graph has five coordinate conditions: one standard two-dimensional Hydra
+embedding (`kappa = 1`, curvature -1) centred by a Poincare-disk isometry, and
+four uniform rescalings of one classical two-dimensional MDS base embedding to
+maximum radii 0.50, 0.70, 0.85, and 0.95. The MDS radii are nested sensitivity
+conditions, not graph or embedding replicates.
+
+Both embedding families reuse one all-pairs shortest-path distance matrix. The
+same sampled ordered pairs are evaluated under every coordinate condition;
+Dijkstra runs once per pair, while all three greedy methods run under every
+condition. For Euclidean routing on the nested MDS radii, the absolute
+tie/progress tolerance scales by `radius / 0.95`, preserving the same decisions
+under uniform scaling. The older `dense_fruchterman_reingold_rescaled_v1`
+layout remains available only for the development smoke and is not an approved
+experimental condition.
 
 ## Experimental design and reproducibility
 
@@ -51,15 +58,23 @@ That conditioning can shift realised average degree; final comparisons must
 record and analyse measured realised degree rather than relying only on the
 matched expectation.
 
-Graph generation, embedding, and source-destination sampling use separate
-master-seed streams. Derived 32-bit seeds use versioned, domain-separated
-BLAKE2s experiment identities; Python's process-randomised `hash()` is never
-used. Every configured development and provisional-full seed use is checked for
-collisions. The experiment also fixes node ordering, pair ordering, numerical
-tolerances, and routing tie breaking. Exact settings and seed-derivation
-metadata have canonical JSON serialization and a SHA-256 configuration
-fingerprint in `code/experiment_config.py`. Structured smoke provenance also
-records a SHA-256 fingerprint over the exact Stage 1-11 source modules.
+Graph generation, the development-only force layout, and source-destination
+sampling use separate master-seed streams. Hydra and MDS are deterministic
+given the shared distance-matrix input. Derived 32-bit seeds use versioned,
+domain-separated BLAKE2s experiment identities; Python's process-randomised
+`hash()` is never used. Every configured development and provisional-full seed
+use is checked for collisions. The experiment also fixes node ordering, pair
+ordering, numerical tolerances, and routing tie breaking. Exact settings and
+seed-derivation metadata have canonical JSON serialization and a SHA-256
+configuration fingerprint in `code/experiment_config.py`. Structured smoke
+provenance also records a SHA-256 fingerprint over the exact Stage 1-11 source
+modules.
+
+Approved experimental graphs use non-boolean integer node IDs from `0` through
+`n - 1`. Low-level embedding fixtures may instead use homogeneous string
+labels. Mixed labels, booleans, and custom object labels are rejected before
+embedding-input fingerprinting, so unstable object representations cannot
+silently affect experimental provenance.
 
 ## Repository structure
 
@@ -104,13 +119,26 @@ Run the small deterministic Stage 11 integration experiment with:
 It uses only development settings, at most five fixed pairs per graph, and
 writes no results or plots.
 
+## Approved-embedding feasibility pilot
+
+Run the small in-memory Hydra/MDS feasibility pilot with:
+
+```powershell
+.\.venv\Scripts\python.exe -B code\run_embedding_feasibility.py
+```
+
+It uses three excluded development graphs and five pairs per graph. It prints
+diagnostics and workload counts, writes no outputs or plots, and does not run
+the full configuration.
+
 The proposed full configuration remains provisional: 9 matched parameter
 settings, 2 graph models, and 20 repetitions produce 360 graphs. At 1,000
-ordered pairs per graph, that is 360,000 pair evaluations for each of Dijkstra,
-Euclidean greedy, hyperbolic greedy, and repaired hyperbolic routing, or
-1,440,000 total method executions. It also entails 360 embedding runs and
-65,916,000 unordered-pair distortion evaluations. The grid contains 180 ER and
-180 BA replicates; the 50-attempt ER cap implies at most 9,000 ER candidate
-draws, or 9,180 total generator calls including one call per BA graph. The full
-experiment must not run until the embedding method and full settings receive
-explicit approval.
+ordered pairs per graph, that is 360,000 Dijkstra runs and 1,800,000 runs of
+each greedy method across the five coordinate conditions: 5,760,000 routing
+executions in total. It also entails 360 Hydra runs, 360 MDS base runs, 1,440
+nested MDS radius transformations, 65,916,000 unordered-pair distortion
+evaluations per condition, and 329,580,000 across all five conditions. The grid
+contains 180 ER and 180 BA replicates; the 50-attempt ER cap implies at most
+9,000 ER candidate draws, or 9,180 total generator calls including one call per
+BA graph. The full experiment must not run until the provisional full settings
+and workload receive explicit approval.
