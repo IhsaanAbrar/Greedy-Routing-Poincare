@@ -8,10 +8,11 @@ tie-breaking so that the routing methods are compared on the same inputs.
 
 ## Current status
 
-Development Stages 1-13 are implemented: validated experiment settings,
+Development Stages 1-14 are implemented: validated experiment settings,
 distance and disk utilities, connected ER and BA generation, network metrics,
 embedding distortion, Dijkstra and all three routing variants, deterministic
-pair sampling, and a small integration smoke runner. The approved co-equal
+pair sampling, a small integration smoke runner, and the guarded production
+runner with atomic resumable per-graph checkpoints. The approved co-equal
 embeddings are deterministic standard two-dimensional Hydra at curvature -1
 and classical two-dimensional MDS.
 
@@ -126,6 +127,45 @@ Run the small in-memory Hydra/MDS feasibility pilot with:
 It uses three excluded development graphs and five pairs per graph. It prints
 diagnostics and workload counts, writes no outputs or plots, and does not run
 the full configuration.
+
+## Production runner and checkpoints
+
+The Step 14 preflight is read-only and must pass before a production run:
+
+```powershell
+.\.venv\Scripts\python.exe -B code\run_full_experiment.py preflight --mode full --confirm-full-run 8e002ef20f96a4f66c80440c9734cd28b6c0851a95a7977d5e2b7cf905f7a78a
+```
+
+Audit existing checkpoints without writing:
+
+```powershell
+.\.venv\Scripts\python.exe -B code\run_full_experiment.py audit
+```
+
+Run the disposable, non-scientific ER/BA checkpoint fixture:
+
+```powershell
+.\.venv\Scripts\python.exe -B code\run_full_experiment.py development-fixture
+```
+
+The following command authorises the complete 360-graph scientific workload
+and should be used only after reviewing the preflight:
+
+```powershell
+.\.venv\Scripts\python.exe -B code\run_full_experiment.py run --mode full --confirm-full-run 8e002ef20f96a4f66c80440c9734cd28b6c0851a95a7977d5e2b7cf905f7a78a
+```
+
+To resume the same compatible run after a clean read-only audit, add the sole
+production resume switch:
+
+```powershell
+.\.venv\Scripts\python.exe -B code\run_full_experiment.py run --mode full --confirm-full-run 8e002ef20f96a4f66c80440c9734cd28b6c0851a95a7977d5e2b7cf905f7a78a --resume
+```
+
+The default output root is the ignored `results/` directory. Preflight,
+planning, imports, and tests do not create it. Complete graph directories are
+never overwritten; incomplete, corrupt, or provenance-incompatible state
+stops execution.
 
 The frozen full configuration has 9 matched parameter settings, 2 graph
 models, and 20 repetitions, producing 360 graphs. At 1,000
