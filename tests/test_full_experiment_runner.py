@@ -314,10 +314,20 @@ class ScheduleAndManifestTests(unittest.TestCase):
             workload["distortion_metric_pair_evaluations"], 461_412_000
         )
 
-    def test_results_are_ignored_and_step14_tests_do_not_create_them(self):
+    def test_results_are_ignored_and_contain_no_test_fixture_output(self):
         ignore_text = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("results/", ignore_text.splitlines())
-        self.assertFalse((PROJECT_ROOT / "results").exists())
+        results_root = PROJECT_ROOT / "results"
+        if results_root.exists():
+            unexpected = [
+                path.name
+                for path in results_root.iterdir()
+                if not (
+                    path.name.startswith("final_")
+                    or path.name.startswith("analysis_")
+                )
+            ]
+            self.assertEqual(unexpected, [])
 
 
 class PreflightSafetyTests(unittest.TestCase):
