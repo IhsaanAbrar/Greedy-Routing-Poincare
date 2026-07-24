@@ -18,7 +18,7 @@ from network_metrics import (
     prepare_all_pairs_shortest_paths,
     validate_shortest_path_data,
 )
-from poincare_distance import poincare_distance, validate_disk_point
+from poincare_distance import euclidean_distance, poincare_distance, validate_disk_point
 
 
 DEFAULT_DISK_EPSILON = 1e-6
@@ -149,6 +149,7 @@ class EmbeddingDistortion:
     mean_relative_distortion: float
     rmse_relative_distortion: float
     unordered_pair_count: int
+    metric: str = "poincare"
 
     @property
     def alpha(self) -> float:
@@ -170,6 +171,7 @@ class EmbeddingDistortion:
             "mean_relative_distortion": self.mean_relative_distortion,
             "rmse_relative_distortion": self.rmse_relative_distortion,
             "unordered_pair_count": self.unordered_pair_count,
+            "metric": self.metric,
         }
 
 
@@ -667,10 +669,11 @@ def calculate_embedding_distortion(
     *,
     tolerance: float = DEFAULT_NUMERICAL_TOLERANCE,
     shortest_paths: AllPairsShortestPathData | None = None,
+    metric: str = "poincare",
 ) -> EmbeddingDistortion:
     r"""Measure scale-fitted relative distortion over all unordered pairs.
 
-    For graph distance ``g_ij`` and Poincare distance ``h_ij``, define
+    For graph distance ``g_ij`` and the selected geometric distance ``h_ij``, define
     ``q_ij = h_ij / g_ij`` and fit
 
     ``alpha = sum(q_ij) / sum(q_ij**2)``.
@@ -684,6 +687,8 @@ def calculate_embedding_distortion(
     if graph.number_of_nodes() < 2:
         raise ValueError("embedding distortion requires at least two graph nodes")
     validated_tolerance = _require_positive_finite("tolerance", tolerance)
+    if metric not in ("euclidean", "poincare"):
+        raise ValueError("metric must be 'euclidean' or 'poincare'")
     path_data = (
         prepare_all_pairs_shortest_paths(graph)
         if shortest_paths is None
@@ -703,10 +708,26 @@ def calculate_embedding_distortion(
         )
 
     ordered_nodes = _stable_node_order(graph)
-    validated_coordinates = {
-        node: validate_disk_point(coordinates[node], name=f"coordinate[{node!r}]")
-        for node in ordered_nodes
-    }
+    if metric == "poincare":
+        validated_coordinates = {
+            node: validate_disk_point(
+                coordinates[node], name=f"coordinate[{node!r}]"
+            )
+            for node in ordered_nodes
+        }
+        distance_function = lambda left, right: poincare_distance(
+            left,
+            right,
+            tolerance=validated_tolerance,
+        )
+    else:
+        validated_coordinates = {
+            node: _as_finite_point(
+                coordinates[node], name=f"coordinate[{node!r}]"
+            )
+            for node in ordered_nodes
+        }
+        distance_function = euclidean_distance
     shortest_path_lengths = path_data.distances
 
     ratios: list[float] = []
@@ -715,10 +736,9 @@ def calculate_embedding_distortion(
             graph_distance = shortest_path_lengths[left][right]
             if graph_distance <= 0:
                 raise RuntimeError("distinct connected vertices must have positive distance")
-            geometric_distance = poincare_distance(
+            geometric_distance = distance_function(
                 validated_coordinates[left],
                 validated_coordinates[right],
-                tolerance=validated_tolerance,
             )
             ratio = geometric_distance / float(graph_distance)
             if not isfinite(ratio) or ratio < 0.0:
@@ -749,4 +769,5 @@ def calculate_embedding_distortion(
         mean_relative_distortion=mean_relative_distortion,
         rmse_relative_distortion=rmse_relative_distortion,
         unordered_pair_count=len(ratios),
+        metric=metric,
     )

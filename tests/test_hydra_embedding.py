@@ -209,7 +209,7 @@ class StandardHydraTests(unittest.TestCase):
             prepare_all_pairs_shortest_paths(graph),
             configuration_fingerprint="cycle-five",
         )
-        coordinates, _, _, group_sizes = _standard_hydra_coordinates(
+        coordinates, _, _, group_sizes, _, _ = _standard_hydra_coordinates(
             embedding_input.distance_matrix,
             eigenvalue_tolerance=1e-12,
         )
@@ -246,7 +246,7 @@ class StandardHydraTests(unittest.TestCase):
             )
         )
 
-        coordinates, _, _, _ = _standard_hydra_coordinates(
+        coordinates, _, _, _, _, _ = _standard_hydra_coordinates(
             embedding_input.distance_matrix,
             eigenvalue_tolerance=1e-12,
         )
@@ -258,6 +258,52 @@ class StandardHydraTests(unittest.TestCase):
             atol=2e-14,
         )
         self.assertEqual(float(np.min(expected_radii)), 0.0)
+
+    def test_rank_one_uses_coordinate_zero_and_preserves_pairwise_distances(self):
+        graph = nx.path_graph(5)
+        embedding_input = prepare_embedding_input(
+            graph,
+            prepare_all_pairs_shortest_paths(graph),
+            configuration_fingerprint="rank-one-axis-regression",
+        )
+
+        result = embed_hydra(embedding_input)
+        coordinates = np.asarray(
+            [result.coordinates[node] for node in result.metadata.node_order],
+            dtype=np.float64,
+        )
+        previous_axis_order = coordinates[:, ::-1]
+
+        self.assertEqual(result.metadata.effective_spatial_rank, 1)
+        self.assertTrue(np.any(coordinates[:, 0] != 0.0))
+        np.testing.assert_array_equal(
+            coordinates[:, 1],
+            np.zeros(len(coordinates), dtype=np.float64),
+        )
+        self.assertTrue(np.isfinite(coordinates).all())
+        self.assertTrue(
+            np.all(np.linalg.norm(coordinates, axis=1) < 1.0)
+        )
+        np.testing.assert_allclose(
+            np.linalg.norm(
+                coordinates[:, np.newaxis, :]
+                - coordinates[np.newaxis, :, :],
+                axis=2,
+            ),
+            np.linalg.norm(
+                previous_axis_order[:, np.newaxis, :]
+                - previous_axis_order[np.newaxis, :, :],
+                axis=2,
+            ),
+            rtol=0.0,
+            atol=0.0,
+        )
+        np.testing.assert_allclose(
+            _pairwise_poincare_distances(coordinates),
+            _pairwise_poincare_distances(previous_axis_order),
+            rtol=0.0,
+            atol=0.0,
+        )
 
     def test_output_is_deterministic_and_strictly_inside_disk(self):
         first = embed_hydra(self.input)
@@ -309,7 +355,7 @@ class StandardHydraTests(unittest.TestCase):
         self.assertLessEqual(residual, 1e-10)
 
     def test_centering_preserves_every_pairwise_distance(self):
-        uncentered, _, _, _ = _standard_hydra_coordinates(
+        uncentered, _, _, _, _, _ = _standard_hydra_coordinates(
             self.input.distance_matrix,
             eigenvalue_tolerance=1e-12,
         )
@@ -345,7 +391,14 @@ class StandardHydraTests(unittest.TestCase):
             patch.object(
                 hydra_module,
                 "_standard_hydra_coordinates",
-                return_value=(uncentered, 1.0, (-0.2, -0.1), ()),
+                return_value=(
+                    uncentered,
+                    1.0,
+                    (-0.2, -0.1),
+                    (),
+                    1e-12,
+                    2,
+                ),
             ),
             patch.object(
                 hydra_module,

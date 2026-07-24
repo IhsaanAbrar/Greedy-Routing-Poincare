@@ -3,7 +3,7 @@
 The two ordinary greedy wrappers share exactly one routing core.  Their only
 difference is the distance function used to rank a current vertex's neighbours.
 The repaired variant adds one history-only backtracking attempt after an
-ordinary hyperbolic ``local_minimum`` or ``cycle`` failure.
+ordinary hyperbolic ``local_minimum`` or ``attempted_revisit`` failure.
 """
 
 from __future__ import annotations
@@ -31,10 +31,14 @@ HYPERBOLIC_GREEDY_METHOD = "hyperbolic_greedy"
 REPAIRED_HYPERBOLIC_GREEDY_METHOD = "repaired_hyperbolic_greedy"
 
 LOCAL_MINIMUM = "local_minimum"
-CYCLE = "cycle"
-STEP_LIMIT = "step_limit"
-REPAIR_UNAVAILABLE = "repair_unavailable"
-REPAIR_FAILED = "repair_failed"
+ATTEMPTED_REVISIT = "attempted_revisit"
+CYCLE = ATTEMPTED_REVISIT
+REPAIR_UNAVAILABLE_AT_SOURCE = "repair_unavailable_at_source"
+REPAIR_UNAVAILABLE = REPAIR_UNAVAILABLE_AT_SOURCE
+NO_ALTERNATIVE_AFTER_BACKTRACKING = "no_alternative_after_backtracking"
+REPAIR_FAILED = NO_ALTERNATIVE_AFTER_BACKTRACKING
+POST_REPAIR_LOCAL_MINIMUM = "post_repair_local_minimum"
+POST_REPAIR_ATTEMPTED_REVISIT = "post_repair_attempted_revisit"
 
 DEFAULT_NUMERICAL_TOLERANCE = DEVELOPMENT_CONFIG.numerical_tolerance
 
@@ -223,7 +227,8 @@ class RoutingResult:
         if self.repair_attempted:
             if self.initial_failure_type not in (LOCAL_MINIMUM, CYCLE):
                 raise ValueError(
-                    "an attempted repair must follow a local minimum or cycle"
+                    "an attempted repair must follow a local minimum or "
+                    "attempted revisit"
                 )
             if alternative_existed is None:
                 raise ValueError(
@@ -231,9 +236,8 @@ class RoutingResult:
                 )
             if alternative_existed:
                 if not self.success and self.final_failure_type not in (
-                    LOCAL_MINIMUM,
-                    CYCLE,
-                    STEP_LIMIT,
+                    POST_REPAIR_LOCAL_MINIMUM,
+                    POST_REPAIR_ATTEMPTED_REVISIT,
                 ):
                     raise ValueError(
                         "a failed repair with an alternative must record its terminal "
@@ -241,7 +245,7 @@ class RoutingResult:
                     )
             elif self.final_failure_type != REPAIR_FAILED:
                 raise ValueError(
-                    "a repair without an alternative must end with repair_failed"
+                    "a repair without an alternative must record no alternative"
                 )
         else:
             if alternative_existed is True:
@@ -256,7 +260,7 @@ class RoutingResult:
                 ):
                     raise ValueError(
                         "an unavailable repair must follow a source-level local "
-                        "minimum or cycle"
+                        "minimum or attempted revisit"
                     )
             elif self.success:
                 if self.initial_failure_type is not None:
@@ -271,11 +275,16 @@ class RoutingResult:
         if self.final_failure_type == REPAIR_UNAVAILABLE and not (
             not self.repair_attempted and alternative_existed is False
         ):
-            raise ValueError("repair_unavailable requires an unattempted source repair")
+            raise ValueError(
+                "repair_unavailable_at_source requires an unattempted source repair"
+            )
         if self.final_failure_type == REPAIR_FAILED and not (
             self.repair_attempted and alternative_existed is False
         ):
-            raise ValueError("repair_failed requires an attempted repair with no alternative")
+            raise ValueError(
+                "no_alternative_after_backtracking requires an attempted repair "
+                "with no alternative"
+            )
 
     @property
     def route(self) -> tuple[int, ...]:
@@ -380,7 +389,7 @@ def _validate_step_limit(
 ) -> int:
     if step_limit is None:
         multiplier = 2 if repair_allowed else 1
-        return max(1, multiplier * graph.number_of_nodes() + 1)
+        return max(1, multiplier * graph.number_of_nodes())
     if isinstance(step_limit, bool) or not isinstance(step_limit, int):
         raise ValueError("step_limit must be an integer")
     if step_limit <= 0:
@@ -585,8 +594,9 @@ def _continue_greedy_walk(
 ) -> _GreedyOutcome:
     while walk[-1] != destination:
         if forwarding_decisions >= step_limit:
-            return _GreedyOutcome(
-                False, tuple(walk), STEP_LIMIT, forwarding_decisions
+            raise RoutingInvariantError(
+                "defensive routing step limit reached; this indicates an "
+                "implementation invariant failure"
             )
 
         current = walk[-1]
@@ -661,7 +671,11 @@ def _result_from_outcome(
 
 
 def dijkstra_benchmark(
-    graph: nx.Graph, source: int, destination: int
+    graph: nx.Graph,
+    source: int,
+    destination: int,
+    *,
+    expected_shortest_path_length: int | None = None,
 ) -> RoutingResult:
     """Return NetworkX's unweighted Dijkstra path as the global benchmark."""
 
@@ -678,6 +692,19 @@ def dijkstra_benchmark(
         ) from exc
 
     route_length = len(path) - 1
+    if expected_shortest_path_length is not None:
+        if (
+            isinstance(expected_shortest_path_length, bool)
+            or not isinstance(expected_shortest_path_length, Integral)
+            or int(expected_shortest_path_length) < 0
+        ):
+            raise ValueError(
+                "expected_shortest_path_length must be a non-negative integer"
+            )
+        if route_length != int(expected_shortest_path_length):
+            raise RoutingInvariantError(
+                "Dijkstra route length disagrees with the prepared APSP matrix"
+            )
     _validate_walk_edges(graph, path)
     return RoutingResult(
         method=DIJKSTRA_METHOD,
@@ -838,7 +865,7 @@ def repaired_hyperbolic_greedy_route(
     """Apply hyperbolic greedy routing with at most one local repair.
 
     Repair is triggered only by the first ordinary ``local_minimum`` or
-    ``cycle``.  The walk backtracks one physical edge, excludes the failed
+    ``attempted_revisit``. The walk backtracks one physical edge, excludes the failed
     branch and all explored vertices, chooses the best remaining neighbour by
     Poincare distance (with node-ID tie-breaking), and then resumes the strict
     ordinary greedy rule.  No graph-distance or shortest-path information is
@@ -946,18 +973,9 @@ def repaired_hyperbolic_greedy_route(
         )
 
     if initial.forwarding_decisions >= maximum_steps:
-        return _repaired_result(
-            routing_graph,
-            source=source,
-            destination=destination,
-            success=False,
-            walk=physical_walk,
-            final_failure_type=STEP_LIMIT,
-            forwarding_decisions=initial.forwarding_decisions,
-            initial_failure_type=initial.failure_type,
-            repair_attempted=True,
-            repair_succeeded=False,
-            repair_alternative_existed=True,
+        raise RoutingInvariantError(
+            "defensive repaired-routing step limit reached; this indicates "
+            "an implementation invariant failure"
         )
 
     selected = _select_best_neighbour(
@@ -990,13 +1008,18 @@ def repaired_hyperbolic_greedy_route(
         explored,
         forwarding_decisions,
     )
+    final_failure_type = repaired.failure_type
+    if final_failure_type == LOCAL_MINIMUM:
+        final_failure_type = POST_REPAIR_LOCAL_MINIMUM
+    elif final_failure_type == CYCLE:
+        final_failure_type = POST_REPAIR_ATTEMPTED_REVISIT
     return _repaired_result(
         routing_graph,
         source=source,
         destination=destination,
         success=repaired.success,
         walk=repaired.walk,
-        final_failure_type=repaired.failure_type,
+        final_failure_type=final_failure_type,
         forwarding_decisions=repaired.forwarding_decisions,
         initial_failure_type=initial.failure_type,
         repair_attempted=True,

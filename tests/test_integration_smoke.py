@@ -172,7 +172,7 @@ class IntegrationSmokeTests(unittest.TestCase):
             sampling = dict(graph_record.pair_sampling_metadata)
             self.assertEqual(
                 sampling["algorithm"],
-                "python_random_sample_without_replacement_v1",
+                "blake2s_uint64_rejection_without_replacement_v1",
             )
             self.assertTrue(sampling["ordered_pairs_are_unique"])
             self.assertIsInstance(

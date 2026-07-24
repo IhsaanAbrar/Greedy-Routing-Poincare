@@ -20,18 +20,21 @@ from experiment_config import (
     BA_FINITE_DEGREE_MATCH_RULE,
     BA_INITIAL_GRAPH,
     BARABASI_ALBERT,
+    COMBINED_FREEZE_HASH,
     CONFIGURATION_SCHEMA_VERSION,
+    DATA_GENERATION_HASH,
     ERDOS_RENYI,
     GRAPH_GENERATION_ATTEMPT_SEED_DOMAIN,
     MAX_SEED,
     SEED_DERIVATION_ALGORITHM,
+    SEED_IDENTITY_VERSION,
     SEED_SPACE_SIZE,
     ExperimentConfig,
     derive_domain_seed,
 )
 
 
-MetadataValue = str | int | float
+MetadataValue = str | int | float | list[int]
 GraphMetadata = dict[str, MetadataValue]
 
 
@@ -146,9 +149,14 @@ def _metadata(
     generation_attempt_count: int,
     generation_attempt_index: int,
     generation_attempt_seed: int,
+    generation_attempt_seeds: Sequence[int],
+    rejected_disconnected_count: int,
+    realised_edge_count: int,
     setting_index: int | None,
     seed_derivation_algorithm: str = SEED_DERIVATION_ALGORITHM,
     p: float | None = None,
+    p_exact_numerator: int | None = None,
+    p_exact_denominator: int | None = None,
     m: int | None = None,
 ) -> GraphMetadata:
     metadata: GraphMetadata = {
@@ -159,12 +167,20 @@ def _metadata(
         "generation_attempt_count": generation_attempt_count,
         "generation_attempt_index": generation_attempt_index,
         "generation_attempt_seed": generation_attempt_seed,
+        "generation_attempt_seeds": list(generation_attempt_seeds),
+        "rejected_disconnected_count": rejected_disconnected_count,
+        "realised_edge_count": realised_edge_count,
+        "realised_average_degree": (2.0 * realised_edge_count) / n,
         "seed_derivation_algorithm": seed_derivation_algorithm,
     }
     if setting_index is not None:
         metadata["setting_index"] = setting_index
     if p is not None:
         metadata["p"] = p
+        metadata["p_float64_hex"] = float(p).hex()
+        if p_exact_numerator is not None and p_exact_denominator is not None:
+            metadata["p_exact_numerator"] = p_exact_numerator
+            metadata["p_exact_denominator"] = p_exact_denominator
     if m is not None:
         metadata["m"] = m
         metadata["ba_initial_graph"] = BA_INITIAL_GRAPH
@@ -180,6 +196,8 @@ def generate_connected_erdos_renyi(
     max_attempts: int,
     setting_index: int | None = None,
     attempt_seeds: Sequence[int] | None = None,
+    p_exact_numerator: int | None = None,
+    p_exact_denominator: int | None = None,
 ) -> GeneratedGraph:
     """Generate a connected simple ``G(n, p)`` graph deterministically.
 
@@ -193,6 +211,17 @@ def generate_connected_erdos_renyi(
     )
     _validate_probability(p)
     _validate_max_attempts(max_attempts)
+    if (p_exact_numerator is None) != (p_exact_denominator is None):
+        raise ValueError(
+            "p_exact_numerator and p_exact_denominator must be provided together"
+        )
+    if p_exact_numerator is not None:
+        _require_non_negative_int("p_exact_numerator", p_exact_numerator)
+        _require_int("p_exact_denominator", p_exact_denominator)
+        if p_exact_numerator <= 0 or p_exact_denominator <= 0:
+            raise ValueError("exact p numerator and denominator must be positive")
+        if float(p) != p_exact_numerator / p_exact_denominator:
+            raise ValueError("p does not match its exact numerator and denominator")
     if setting_index is not None:
         _require_non_negative_int("setting_index", setting_index)
     validated_attempt_seeds: tuple[int, ...] | None = None
@@ -209,7 +238,7 @@ def generate_connected_erdos_renyi(
         if len(set(validated_attempt_seeds)) != len(validated_attempt_seeds):
             raise ValueError("attempt_seeds must be unique")
 
-    used_attempt_seeds: set[int] = set()
+    used_attempt_seeds: list[int] = []
     for attempt_index in range(max_attempts):
         if validated_attempt_seeds is None:
             attempt_seed = derive_attempt_seed(graph_seed, attempt_index)
@@ -219,7 +248,7 @@ def generate_connected_erdos_renyi(
             raise GraphGenerationError(
                 "graph-attempt seed derivation produced a collision"
             )
-        used_attempt_seeds.add(attempt_seed)
+        used_attempt_seeds.append(attempt_seed)
         graph = nx.gnp_random_graph(n, p, seed=attempt_seed, directed=False)
         if nx.is_connected(graph):
             _assert_graph_invariants(graph, n, ERDOS_RENYI)
@@ -234,7 +263,12 @@ def generate_connected_erdos_renyi(
                     generation_attempt_count=attempt_index + 1,
                     generation_attempt_index=attempt_index,
                     generation_attempt_seed=attempt_seed,
+                    generation_attempt_seeds=tuple(used_attempt_seeds),
+                    rejected_disconnected_count=attempt_index,
+                    realised_edge_count=graph.number_of_edges(),
                     setting_index=setting_index,
+                    p_exact_numerator=p_exact_numerator,
+                    p_exact_denominator=p_exact_denominator,
                 ),
             )
 
@@ -280,6 +314,9 @@ def generate_connected_barabasi_albert(
             generation_attempt_count=1,
             generation_attempt_index=0,
             generation_attempt_seed=graph_seed,
+            generation_attempt_seeds=(graph_seed,),
+            rejected_disconnected_count=0,
+            realised_edge_count=graph.number_of_edges(),
             setting_index=setting_index,
         ),
     )
@@ -320,6 +357,8 @@ def generate_graph(
                     config.max_connected_graph_generation_attempts
                 )
             ),
+            p_exact_numerator=setting.er_probability_numerator,
+            p_exact_denominator=setting.er_probability_denominator,
         )
     elif model == BARABASI_ALBERT:
         generated = generate_connected_barabasi_albert(
@@ -339,7 +378,10 @@ def generate_graph(
         {
             "configuration_name": config.name,
             "configuration_schema_version": CONFIGURATION_SCHEMA_VERSION,
+            "seed_identity_version": SEED_IDENTITY_VERSION,
             "configuration_fingerprint": config.configuration_fingerprint,
+            "data_generation_hash": DATA_GENERATION_HASH,
+            "combined_freeze_hash": COMBINED_FREEZE_HASH,
             "setting_label": setting.label,
             "embedding_initialization_seed": seeds.embedding_initialization,
             "source_destination_sampling_seed": (

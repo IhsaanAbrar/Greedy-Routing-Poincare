@@ -24,6 +24,8 @@ from experiment_config import (
     ERDOS_RENYI,
     FEASIBILITY_PILOT_SEEDS,
     FULL_EXPERIMENT_CONFIG,
+    MDS_BASE_EMBEDDING_ID,
+    MDS_EMBEDDING_FAMILY,
     ExperimentConfig,
     audit_feasibility_pilot_seed_collisions,
     make_degree_matched_parameters,
@@ -84,10 +86,27 @@ class ConditionDiagnostics:
     frechet_mean_residual: float | None
     mean_relative_distortion: float
     rmse_relative_distortion: float
+    euclidean_mean_relative_distortion: float
+    euclidean_rmse_relative_distortion: float
+    poincare_mean_relative_distortion: float
+    poincare_rmse_relative_distortion: float
     transformation_runtime_ns: int
     euclidean_routing_tolerance: float
     poincare_routing_tolerance: float
     embedding_metadata: object
+
+
+@dataclass(frozen=True)
+class DistortionDiagnostic:
+    metric_condition_id: str
+    embedding_family: str
+    coordinate_condition_id: str
+    metric: str
+    mds_radius: float | None
+    fitted_scale_alpha: float
+    mean_absolute_relative_distortion: float
+    relative_rmse: float
+    unordered_pair_count: int
 
 
 @dataclass(frozen=True)
@@ -104,6 +123,8 @@ class EmbeddingRouteRecord:
     routing_method: str
     success: bool
     failure_type: str | None
+    initial_failure_type: str | None
+    final_failure_type: str | None
     route_length: int
     dijkstra_length: int
     stretch: float | None
@@ -124,7 +145,7 @@ class GraphFeasibilityRecord:
     pair_seed: int
     er_p: float | None
     ba_m: int | None
-    graph_generation_metadata: Mapping[str, str | int | float]
+    graph_generation_metadata: Mapping[str, object]
     configuration_fingerprint: str
     embedding_input_fingerprint: str
     hydra_runtime_ns: int
@@ -135,6 +156,7 @@ class GraphFeasibilityRecord:
     pair_ids: tuple[str, ...]
     coordinate_condition_ids: tuple[str, ...]
     condition_diagnostics: tuple[ConditionDiagnostics, ...]
+    distortion_diagnostics: tuple[DistortionDiagnostic, ...]
     route_records: tuple[EmbeddingRouteRecord, ...]
 
 
@@ -154,6 +176,8 @@ class _PilotCase:
     graph_family: str
     n: int
     er_p: float | None
+    er_p_exact_numerator: int | None
+    er_p_exact_denominator: int | None
     ba_m: int | None
     graph_seed: int
     pair_seed: int
@@ -165,6 +189,8 @@ class _PilotCase:
                 or not isfinite(self.er_p)
                 or not 0.0 < self.er_p < 1.0
                 or self.ba_m is not None
+                or self.er_p_exact_numerator is None
+                or self.er_p_exact_denominator is None
             ):
                 raise ValueError("ER pilot cases require only a valid er_p")
         elif self.graph_family == BARABASI_ALBERT:
@@ -174,6 +200,8 @@ class _PilotCase:
                 or not isinstance(self.ba_m, int)
                 or not 1 <= self.ba_m < self.n
                 or self.er_p is not None
+                or self.er_p_exact_numerator is not None
+                or self.er_p_exact_denominator is not None
             ):
                 raise ValueError("BA pilot cases require only a valid ba_m")
         else:
@@ -227,7 +255,7 @@ def _validated_configuration_fingerprint(
 
 
 def _validated_generation_metadata(
-    metadata: Mapping[str, str | int | float] | None,
+    metadata: Mapping[str, object] | None,
     *,
     graph_family: str,
     n: int,
@@ -235,7 +263,7 @@ def _validated_generation_metadata(
     graph_seed: int,
     er_p: float | None,
     ba_m: int | None,
-) -> Mapping[str, str | int | float]:
+) -> Mapping[str, object]:
     if metadata is None:
         return MappingProxyType({})
     if not isinstance(metadata, Mapping):
@@ -256,15 +284,24 @@ def _validated_generation_metadata(
         raise ValueError("graph_generation_metadata['p'] does not match er_p")
     if ba_m is not None and copied.get("m") != ba_m:
         raise ValueError("graph_generation_metadata['m'] does not match ba_m")
-    if any(
-        not isinstance(key, str)
-        or not isinstance(value, (str, int, float))
-        or isinstance(value, bool)
-        for key, value in copied.items()
-    ):
+    if any(not isinstance(key, str) for key in copied):
         raise ValueError(
-            "graph_generation_metadata must contain string keys and scalar values"
+            "graph_generation_metadata must contain string keys"
         )
+    for value in copied.values():
+        if isinstance(value, bool) or not isinstance(
+            value, (str, int, float, list)
+        ):
+            raise ValueError(
+                "graph_generation_metadata values must be scalar or integer lists"
+            )
+        if isinstance(value, list) and any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in value
+        ):
+            raise ValueError(
+                "graph_generation_metadata lists must contain integers"
+            )
     return MappingProxyType(dict(sorted(copied.items())))
 
 
@@ -317,6 +354,8 @@ def _route_record(
         routing_method=result.method,
         success=result.success,
         failure_type=result.failure_type,
+        initial_failure_type=result.initial_failure_type,
+        final_failure_type=result.final_failure_type,
         route_length=result.route_length,
         dijkstra_length=dijkstra_length,
         stretch=stretch,
@@ -422,6 +461,9 @@ def run_approved_embedding_pipeline(
         centering_tolerance=design.hydra_centering_tolerance,
         centering_max_iterations=design.hydra_centering_max_iterations,
         eigenvalue_tolerance=design.hydra_eigenvalue_tolerance,
+        pairwise_isometry_absolute_tolerance=(
+            design.hydra_isometry_absolute_tolerance
+        ),
         pairwise_isometry_tolerance=design.hydra_isometry_tolerance,
         boundary_roundoff_tolerance=design.hydra_boundary_roundoff_tolerance,
     )
@@ -455,14 +497,81 @@ def run_approved_embedding_pipeline(
         raise RuntimeError("implementation condition IDs do not match configuration")
 
     metrics = calculate_network_metrics(graph, shortest_paths=shortest_paths)
+    base_mds_euclidean_distortion = calculate_embedding_distortion(
+        graph,
+        mds_base.coordinates,
+        tolerance=config.numerical_tolerance,
+        shortest_paths=shortest_paths,
+        metric="euclidean",
+    )
+    distortion_by_id: dict[str, DistortionDiagnostic] = {
+        "base_mds_euclidean": DistortionDiagnostic(
+            metric_condition_id="base_mds_euclidean",
+            embedding_family=MDS_EMBEDDING_FAMILY,
+            coordinate_condition_id=MDS_BASE_EMBEDDING_ID,
+            metric="euclidean",
+            mds_radius=None,
+            fitted_scale_alpha=base_mds_euclidean_distortion.fitted_scale_alpha,
+            mean_absolute_relative_distortion=(
+                base_mds_euclidean_distortion.mean_relative_distortion
+            ),
+            relative_rmse=base_mds_euclidean_distortion.rmse_relative_distortion,
+            unordered_pair_count=base_mds_euclidean_distortion.unordered_pair_count,
+        )
+    }
     diagnostics: list[ConditionDiagnostics] = []
     prepared_contexts = {}
     for condition in conditions:
-        distortion = calculate_embedding_distortion(
+        poincare_distortion = calculate_embedding_distortion(
             graph,
             condition.coordinates,
             tolerance=config.numerical_tolerance,
             shortest_paths=shortest_paths,
+            metric="poincare",
+        )
+        euclidean_distortion = (
+            calculate_embedding_distortion(
+                graph,
+                condition.coordinates,
+                tolerance=config.numerical_tolerance,
+                shortest_paths=shortest_paths,
+                metric="euclidean",
+            )
+            if condition.mds_radius is None
+            else base_mds_euclidean_distortion
+        )
+        if condition.mds_radius is None:
+            euclidean_metric_id = "hydra_euclidean"
+            distortion_by_id[euclidean_metric_id] = DistortionDiagnostic(
+                metric_condition_id=euclidean_metric_id,
+                embedding_family=condition.embedding_family,
+                coordinate_condition_id=condition.coordinate_condition_id,
+                metric="euclidean",
+                mds_radius=None,
+                fitted_scale_alpha=euclidean_distortion.fitted_scale_alpha,
+                mean_absolute_relative_distortion=(
+                    euclidean_distortion.mean_relative_distortion
+                ),
+                relative_rmse=euclidean_distortion.rmse_relative_distortion,
+                unordered_pair_count=euclidean_distortion.unordered_pair_count,
+            )
+            poincare_metric_id = "hydra_poincare"
+        else:
+            poincare_metric_id = (
+                f"mds_poincare_r{int(round(condition.mds_radius * 100)):03d}"
+            )
+        distortion_by_id[poincare_metric_id] = DistortionDiagnostic(
+            metric_condition_id=poincare_metric_id,
+            embedding_family=condition.embedding_family,
+            coordinate_condition_id=condition.coordinate_condition_id,
+            metric="poincare",
+            mds_radius=condition.mds_radius,
+            fitted_scale_alpha=poincare_distortion.fitted_scale_alpha,
+            mean_absolute_relative_distortion=(
+                poincare_distortion.mean_relative_distortion
+            ),
+            relative_rmse=poincare_distortion.rmse_relative_distortion,
+            unordered_pair_count=poincare_distortion.unordered_pair_count,
         )
         euclidean_context = prepare_routing_coordinates(
             graph,
@@ -514,8 +623,24 @@ def run_approved_embedding_pipeline(
                     if condition.mds_radius is None
                     else None
                 ),
-                mean_relative_distortion=distortion.mean_relative_distortion,
-                rmse_relative_distortion=distortion.rmse_relative_distortion,
+                mean_relative_distortion=(
+                    poincare_distortion.mean_relative_distortion
+                ),
+                rmse_relative_distortion=(
+                    poincare_distortion.rmse_relative_distortion
+                ),
+                euclidean_mean_relative_distortion=(
+                    euclidean_distortion.mean_relative_distortion
+                ),
+                euclidean_rmse_relative_distortion=(
+                    euclidean_distortion.rmse_relative_distortion
+                ),
+                poincare_mean_relative_distortion=(
+                    poincare_distortion.mean_relative_distortion
+                ),
+                poincare_rmse_relative_distortion=(
+                    poincare_distortion.rmse_relative_distortion
+                ),
                 transformation_runtime_ns=(
                     0
                     if condition.mds_radius is None
@@ -529,17 +654,24 @@ def run_approved_embedding_pipeline(
             )
         )
 
-    pairs = sample_ordered_pairs(graph.nodes, pair_count, pair_seed)
+    pairs = sample_ordered_pairs(
+        graph.nodes,
+        pair_count,
+        pair_seed,
+        graph_identity=graph_id,
+    )
     pair_ids = tuple(
         f"{graph_id}:pair:{index:04d}" for index in range(len(pairs))
     )
     records: list[EmbeddingRouteRecord] = []
     for pair_id, (source, destination) in zip(pair_ids, pairs, strict=True):
+        expected_dijkstra_length = shortest_paths.distances[source][destination]
         benchmark, benchmark_runtime = _timed_call(
             dijkstra_benchmark,
             graph,
             source,
             destination,
+            expected_shortest_path_length=expected_dijkstra_length,
         )
         records.append(
             _route_record(
@@ -633,6 +765,17 @@ def run_approved_embedding_pipeline(
         er_p=er_p,
         ba_m=ba_m,
     )
+    distortion_order = (
+        "hydra_euclidean",
+        "hydra_poincare",
+        "base_mds_euclidean",
+        "mds_poincare_r050",
+        "mds_poincare_r070",
+        "mds_poincare_r085",
+        "mds_poincare_r095",
+    )
+    if set(distortion_by_id) != set(distortion_order):
+        raise RuntimeError("pipeline did not calculate all seven distortion metrics")
     return GraphFeasibilityRecord(
         graph_id=graph_id,
         graph_family=graph_family,
@@ -656,6 +799,9 @@ def run_approved_embedding_pipeline(
             condition.coordinate_condition_id for condition in conditions
         ),
         condition_diagnostics=tuple(diagnostics),
+        distortion_diagnostics=tuple(
+            distortion_by_id[condition_id] for condition_id in distortion_order
+        ),
         route_records=tuple(records),
     )
 
@@ -673,6 +819,8 @@ def _pilot_cases() -> tuple[_PilotCase, ...]:
             graph_family=ERDOS_RENYI,
             n=30,
             er_p=er_setting.er_p,
+            er_p_exact_numerator=er_setting.er_probability_numerator,
+            er_p_exact_denominator=er_setting.er_probability_denominator,
             ba_m=None,
             graph_seed=FEASIBILITY_PILOT_SEEDS[0],
             pair_seed=FEASIBILITY_PILOT_SEEDS[1],
@@ -682,6 +830,8 @@ def _pilot_cases() -> tuple[_PilotCase, ...]:
             graph_family=BARABASI_ALBERT,
             n=30,
             er_p=None,
+            er_p_exact_numerator=None,
+            er_p_exact_denominator=None,
             ba_m=4,
             graph_seed=FEASIBILITY_PILOT_SEEDS[2],
             pair_seed=FEASIBILITY_PILOT_SEEDS[3],
@@ -691,6 +841,8 @@ def _pilot_cases() -> tuple[_PilotCase, ...]:
             graph_family=BARABASI_ALBERT,
             n=100,
             er_p=None,
+            er_p_exact_numerator=None,
+            er_p_exact_denominator=None,
             ba_m=4,
             graph_seed=FEASIBILITY_PILOT_SEEDS[4],
             pair_seed=FEASIBILITY_PILOT_SEEDS[5],
@@ -715,6 +867,8 @@ def _pilot_configuration_fingerprint() -> str:
                 "er_p_hex": (
                     None if case.er_p is None else float(case.er_p).hex()
                 ),
+                "er_p_exact_numerator": case.er_p_exact_numerator,
+                "er_p_exact_denominator": case.er_p_exact_denominator,
                 "ba_m": case.ba_m,
                 "graph_seed": case.graph_seed,
                 "pair_seed": case.pair_seed,
@@ -752,6 +906,8 @@ def run_embedding_feasibility_pilot() -> EmbeddingFeasibilityReport:
                 replicate_index=0,
                 max_attempts=1,
                 attempt_seeds=(case.graph_seed,),
+                p_exact_numerator=case.er_p_exact_numerator,
+                p_exact_denominator=case.er_p_exact_denominator,
             )
         else:
             if case.ba_m is None:
@@ -785,8 +941,10 @@ def run_embedding_feasibility_pilot() -> EmbeddingFeasibilityReport:
         "mds_base_embedding_runs",
         "mds_nested_radius_transformations",
         "sampled_ordered_pairs",
-        "dijkstra_routing_runs",
-        "routing_method_runs",
+        "actual_dijkstra_executions",
+        "coordinate_dependent_routing_executions",
+        "total_routing_and_benchmark_executions",
+        "distortion_metric_pair_evaluations",
     )
     return EmbeddingFeasibilityReport(
         evidence_label=PILOT_EVIDENCE_LABEL,

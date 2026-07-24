@@ -54,7 +54,7 @@ class ExperimentConfigTests(unittest.TestCase):
         self.assertIs(config.approved_embedding_design, APPROVED_EMBEDDING_DESIGN)
         self.assertFalse(config.is_provisional)
 
-    def test_full_configuration_is_valid_and_marked_provisional(self):
+    def test_full_configuration_is_valid_and_frozen(self):
         config = FULL_EXPERIMENT_CONFIG
 
         self.assertEqual(config.graph_sizes, (100, 300, 1_000))
@@ -72,8 +72,8 @@ class ExperimentConfigTests(unittest.TestCase):
             config.approved_embedding_design.coordinate_condition_ids,
             (HYDRA_CONDITION_ID, *MDS_CONDITION_IDS),
         )
-        self.assertTrue(config.is_provisional)
-        self.assertTrue(config.provisional_values)
+        self.assertFalse(config.is_provisional)
+        self.assertEqual(config.provisional_values, ())
 
     def test_named_configuration_lookup(self):
         self.assertIs(get_config("development"), DEVELOPMENT_CONFIG)
@@ -125,9 +125,9 @@ class ExperimentConfigTests(unittest.TestCase):
         )
 
     def test_replicate_seed_identity_includes_setting_index_and_label(self):
-        config = FULL_EXPERIMENT_CONFIG
-        setting = config.parameter_settings[3]
-        expected = config.seeds_for_replicate(3, BARABASI_ALBERT, 7)
+        config = DEVELOPMENT_CONFIG
+        setting = config.parameter_settings[0]
+        expected = config.seeds_for_replicate(0, BARABASI_ALBERT, 1)
         reordered = replace(
             config,
             parameter_settings=tuple(reversed(config.parameter_settings)),
@@ -142,7 +142,7 @@ class ExperimentConfigTests(unittest.TestCase):
             reordered.seeds_for_replicate(
                 reordered_index,
                 BARABASI_ALBERT,
-                7,
+                1,
             ),
         )
 
@@ -328,7 +328,7 @@ class ExperimentConfigTests(unittest.TestCase):
             workload["distortion_unordered_pairs_per_condition"],
             65_916_000,
         )
-        self.assertEqual(workload["distortion_unordered_pairs"], 329_580_000)
+        self.assertEqual(workload["distortion_unordered_pairs"], 461_412_000)
         self.assertEqual(
             workload["maximum_erdos_renyi_generation_attempts"],
             9_000,
@@ -413,19 +413,12 @@ class ExperimentConfigTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 replace(design, **changes)
 
-    def test_approved_embedding_settings_affect_fingerprint(self):
-        changed_design = replace(
-            APPROVED_EMBEDDING_DESIGN,
-            hydra_centering_tolerance=2e-10,
-        )
-        changed_config = replace(
-            DEVELOPMENT_CONFIG,
-            approved_embedding_design=changed_design,
-        )
-        self.assertNotEqual(
-            changed_config.configuration_fingerprint,
-            DEVELOPMENT_CONFIG.configuration_fingerprint,
-        )
+    def test_approved_embedding_settings_are_frozen(self):
+        with self.assertRaises(ValueError):
+            replace(
+                APPROVED_EMBEDDING_DESIGN,
+                hydra_centering_tolerance=2e-10,
+            )
 
     def test_ordered_pair_request_cannot_exceed_available_pairs(self):
         # n=30 permits 30 * 29 = 870 ordered pairs.
@@ -480,6 +473,7 @@ class ExperimentConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             replace(
                 FULL_EXPERIMENT_CONFIG,
+                is_provisional=True,
                 provisional_values=(),
             )
 

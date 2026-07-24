@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Hashable, Mapping
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from math import atanh, isfinite, sqrt
 from types import MappingProxyType
@@ -16,12 +16,14 @@ from experiment_config import (
     HYDRA_CURVATURE,
     HYDRA_DIMENSION,
     HYDRA_EMBEDDING_FAMILY,
+    HYDRA_FRECHET_ALGORITHM,
+    HYDRA_FRECHET_CONVERGENCE_CRITERION,
     HYDRA_KAPPA,
 )
 
 
 HYDRA_EMBEDDING_VERSION = "standard_hydra_spectral_2d_v1"
-MAX_BOUNDARY_ROUNDOFF_TOLERANCE = 1e-10
+MAX_BOUNDARY_ROUNDOFF_TOLERANCE = 1e-12
 
 
 class HydraEmbeddingError(RuntimeError):
@@ -50,11 +52,21 @@ class HydraEmbeddingMetadata:
     boundary_correction_occurred: bool
     boundary_correction_count: int
     pairwise_isometry_tolerance: float
+    pairwise_isometry_absolute_tolerance: float
     maximum_pairwise_distance_error: float
+    maximum_pairwise_normalized_error: float
     eigenvalue_tolerance: float
+    eigenvalue_absolute_threshold: float
     canonicalized_eigenspace_group_sizes: tuple[int, ...]
     leading_eigenvalue: float
     retained_negative_eigenvalues: tuple[float, float]
+    effective_spatial_rank: int
+    frechet_algorithm: str
+    frechet_convergence_criterion: str
+    coincident_coordinate_group_count: int
+    coincident_vertex_count: int
+    coincident_vertex_pair_count: int
+    coincident_coordinate_groups: tuple[tuple[Hashable, ...], ...]
     radial_rescaling_after_centering: bool
     configuration_fingerprint: str
     embedding_input_fingerprint: str
@@ -79,6 +91,28 @@ def _positive_int(name: str, value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _coincident_coordinate_metadata(
+    coordinates: NDArray[np.float64],
+    node_order: Sequence[Hashable],
+) -> tuple[int, int, int, tuple[tuple[Hashable, ...], ...]]:
+    groups_by_point: dict[tuple[float, float], list[Hashable]] = {}
+    for node, point in zip(node_order, coordinates, strict=True):
+        key = (float(point[0]), float(point[1]))
+        groups_by_point.setdefault(key, []).append(node)
+    groups = tuple(
+        tuple(nodes)
+        for nodes in groups_by_point.values()
+        if len(nodes) > 1
+    )
+    sizes = tuple(len(group) for group in groups)
+    return (
+        len(groups),
+        sum(sizes),
+        sum(size * (size - 1) // 2 for size in sizes),
+        groups,
+    )
 
 
 def _mobius_add(
@@ -289,6 +323,8 @@ def _standard_hydra_coordinates(
     float,
     tuple[float, float],
     tuple[int, ...],
+    float,
+    int,
 ]:
     """Implement Algorithm 1 of Keller-Ressel and Nargang for d=2, kappa=1."""
 
@@ -305,6 +341,12 @@ def _standard_hydra_coordinates(
     order = np.argsort(-eigenvalues, kind="stable")
     eigenvalues = eigenvalues[order]
     eigenvectors = eigenvectors[:, order]
+    if not np.isfinite(eigenvalues).all():
+        raise HydraEmbeddingError("Hydra eigenvalues are non-finite")
+    absolute_threshold = eigenvalue_tolerance * max(
+        1.0,
+        float(np.max(np.abs(eigenvalues))),
+    )
     try:
         selected_vectors, repeated_group_sizes = (
             canonical_eigenvectors_for_indices(
@@ -320,9 +362,11 @@ def _standard_hydra_coordinates(
         ) from exc
 
     leading_eigenvalue = float(eigenvalues[0])
-    scale = max(1.0, abs(leading_eigenvalue))
-    if leading_eigenvalue <= eigenvalue_tolerance * scale:
-        raise HydraEmbeddingError("Hydra requires a positive leading eigenvalue")
+    if leading_eigenvalue <= absolute_threshold:
+        raise HydraEmbeddingError(
+            "Hydra requires its leading time-like eigenvalue to exceed the "
+            f"global threshold {absolute_threshold:.17g}"
+        )
     leading_vector = np.asarray(selected_vectors[0], dtype=np.float64)
     if float(np.sum(leading_vector)) < 0.0:
         leading_vector *= -1.0
@@ -336,13 +380,39 @@ def _standard_hydra_coordinates(
         float(eigenvalues[-1]),
     )
     spatial_columns: list[NDArray[np.float64]] = []
+    spatial_weights: list[float] = []
+    effective_spatial_rank = 0
     for index, vector in zip(
         (-2, -1),
         selected_vectors[1:],
         strict=True,
     ):
-        weight = sqrt(max(-float(eigenvalues[index]), 0.0))
+        spatial_value = -float(eigenvalues[index])
+        if spatial_value <= absolute_threshold:
+            weight = 0.0
+        else:
+            weight = sqrt(spatial_value)
+            effective_spatial_rank += 1
+        spatial_weights.append(weight)
         spatial_columns.append(vector * weight)
+    if effective_spatial_rank == 0:
+        raise HydraEmbeddingError(
+            "Hydra spatial rank is zero at the global eigenvalue threshold"
+        )
+    if effective_spatial_rank == 1:
+        active_column = next(
+            column
+            for column, weight in zip(
+                spatial_columns,
+                spatial_weights,
+                strict=True,
+            )
+            if weight > 0.0
+        )
+        spatial_columns = [
+            active_column,
+            np.zeros_like(active_column),
+        ]
     spatial = np.column_stack(spatial_columns)
     time = sqrt(leading_eigenvalue) * leading_vector
     if np.any(~np.isfinite(time)) or np.any(time <= 0.0):
@@ -356,7 +426,7 @@ def _standard_hydra_coordinates(
     spatial_norms = np.linalg.norm(spatial, axis=1)
     coordinates = np.zeros((len(time), HYDRA_DIMENSION), dtype=np.float64)
     for index in range(len(time)):
-        if spatial_norms[index] > eigenvalue_tolerance:
+        if spatial_norms[index] > 0.0:
             coordinates[index] = (
                 radial[index] * spatial[index] / spatial_norms[index]
             )
@@ -370,11 +440,15 @@ def _standard_hydra_coordinates(
         raise HydraEmbeddingError("Hydra produced non-finite Poincare coordinates")
     if np.any(np.linalg.norm(coordinates, axis=1) >= 1.0):
         raise HydraEmbeddingError("Hydra radial projection left the open unit disk")
+    if not np.any(np.linalg.norm(coordinates - coordinates[0], axis=1) > 0.0):
+        raise HydraEmbeddingError("Hydra coordinates completely collapsed")
     return (
         coordinates,
         leading_eigenvalue,
         retained_negative_values,
         repeated_group_sizes,
+        absolute_threshold,
+        effective_spatial_rank,
     )
 
 
@@ -386,6 +460,7 @@ def embed_hydra(
     centering_tolerance: float = 1e-10,
     centering_max_iterations: int = 256,
     eigenvalue_tolerance: float = 1e-12,
+    pairwise_isometry_absolute_tolerance: float = 1e-10,
     pairwise_isometry_tolerance: float = 1e-9,
     boundary_roundoff_tolerance: float = 1e-12,
 ) -> HydraEmbeddingResult:
@@ -415,6 +490,10 @@ def embed_hydra(
     validated_isometry_tolerance = _positive_finite(
         "pairwise_isometry_tolerance", pairwise_isometry_tolerance
     )
+    validated_isometry_absolute_tolerance = _positive_finite(
+        "pairwise_isometry_absolute_tolerance",
+        pairwise_isometry_absolute_tolerance,
+    )
     validated_boundary_tolerance = _positive_finite(
         "boundary_roundoff_tolerance", boundary_roundoff_tolerance
     )
@@ -429,6 +508,8 @@ def embed_hydra(
         leading,
         retained_negative,
         repeated_group_sizes,
+        absolute_threshold,
+        effective_spatial_rank,
     ) = _standard_hydra_coordinates(
         embedding_input.distance_matrix,
         eigenvalue_tolerance=validated_eigenvalue_tolerance,
@@ -465,14 +546,18 @@ def embed_hydra(
 
     distances_after = _pairwise_poincare_distances(centered)
     absolute_errors = np.abs(distances_after - distances_before)
-    allowed_errors = validated_isometry_tolerance * np.maximum(
-        1.0, distances_before
+    allowed_errors = (
+        validated_isometry_absolute_tolerance
+        + validated_isometry_tolerance
+        * np.maximum(np.abs(distances_before), np.abs(distances_after))
     )
-    if np.any(absolute_errors > allowed_errors):
+    normalized_errors = absolute_errors / allowed_errors
+    if np.any(normalized_errors > 1.0):
         raise HydraEmbeddingError(
             "Frechet centring failed the pairwise Poincare-distance isometry check"
         )
     maximum_distance_error = float(np.max(absolute_errors))
+    maximum_normalized_error = float(np.max(normalized_errors))
     maximum_norm = float(np.max(centered_norms))
     coordinates = MappingProxyType(
         {
@@ -484,6 +569,12 @@ def embed_hydra(
             )
         }
     )
+    (
+        coincident_group_count,
+        coincident_vertex_count,
+        coincident_pair_count,
+        coincident_groups,
+    ) = _coincident_coordinate_metadata(centered, embedding_input.node_order)
     return HydraEmbeddingResult(
         coordinates=coordinates,
         metadata=HydraEmbeddingMetadata(
@@ -503,11 +594,25 @@ def embed_hydra(
             boundary_correction_occurred=correction_count > 0,
             boundary_correction_count=correction_count,
             pairwise_isometry_tolerance=validated_isometry_tolerance,
+            pairwise_isometry_absolute_tolerance=(
+                validated_isometry_absolute_tolerance
+            ),
             maximum_pairwise_distance_error=maximum_distance_error,
+            maximum_pairwise_normalized_error=maximum_normalized_error,
             eigenvalue_tolerance=validated_eigenvalue_tolerance,
+            eigenvalue_absolute_threshold=absolute_threshold,
             canonicalized_eigenspace_group_sizes=repeated_group_sizes,
             leading_eigenvalue=leading,
             retained_negative_eigenvalues=retained_negative,
+            effective_spatial_rank=effective_spatial_rank,
+            frechet_algorithm=HYDRA_FRECHET_ALGORITHM,
+            frechet_convergence_criterion=(
+                HYDRA_FRECHET_CONVERGENCE_CRITERION
+            ),
+            coincident_coordinate_group_count=coincident_group_count,
+            coincident_vertex_count=coincident_vertex_count,
+            coincident_vertex_pair_count=coincident_pair_count,
+            coincident_coordinate_groups=coincident_groups,
             radial_rescaling_after_centering=False,
             configuration_fingerprint=(
                 embedding_input.configuration_fingerprint

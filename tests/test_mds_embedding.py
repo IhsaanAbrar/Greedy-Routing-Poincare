@@ -239,13 +239,15 @@ class ClassicalMDSTests(unittest.TestCase):
                     significant_count,
                 )
 
-    def test_insufficient_positive_dimensions_fail_clearly(self):
+    def test_rank_one_is_zero_padded_and_recorded(self):
         collinear = np.array([[0.0, 0.0], [1.0, 0.0], [3.0, 0.0]])
-        with self.assertRaisesRegex(
-            ClassicalMDSError,
-            "at least two eigenvalues",
-        ):
-            classical_mds(make_input(euclidean_distance_matrix(collinear)))
+        result = classical_mds(make_input(euclidean_distance_matrix(collinear)))
+
+        self.assertEqual(result.metadata.effective_rank, 1)
+        np.testing.assert_array_equal(
+            result.coordinate_matrix[:, 1],
+            np.zeros(3),
+        )
 
     def test_four_exact_nested_radius_transformations(self):
         base = classical_mds(self.input)

@@ -12,7 +12,6 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import platform
-from random import Random
 import sys
 from typing import Any
 
@@ -30,6 +29,10 @@ from experiment_config import (
     ERDOS_RENYI,
     MAX_SEED,
     ExperimentConfig,
+)
+from experiment_protocol import (
+    graph_identity as frozen_graph_identity,
+    sample_ordered_pairs as frozen_sample_ordered_pairs,
 )
 from graph_generation import generate_graph
 from network_metrics import (
@@ -56,6 +59,7 @@ SMOKE_RESULT_SCHEMA_VERSION = 2
 IMPLEMENTATION_SOURCE_FILES = (
     "embedding.py",
     "experiment_config.py",
+    "experiment_protocol.py",
     "graph_generation.py",
     "network_metrics.py",
     "poincare_distance.py",
@@ -135,48 +139,35 @@ def _validate_seed(seed: int) -> None:
 
 
 def sample_ordered_pairs(
-    nodes: Iterable[int], pair_count: int, seed: int
+    nodes: Iterable[int],
+    pair_count: int,
+    seed: int,
+    *,
+    graph_identity: str | None = None,
 ) -> tuple[tuple[int, int], ...]:
-    """Sample unique ordered pairs from a stable node order."""
+    """Compatibility entry point for the frozen version-independent sampler."""
 
-    ordered_nodes = tuple(nodes)
-    if any(isinstance(node, bool) or not isinstance(node, int) for node in ordered_nodes):
+    supplied_nodes = tuple(nodes)
+    if any(
+        isinstance(node, bool) or not isinstance(node, int)
+        for node in supplied_nodes
+    ):
         raise ValueError("nodes must be integer IDs")
-    if len(set(ordered_nodes)) != len(ordered_nodes):
-        raise ValueError("nodes must be unique")
-    ordered_nodes = tuple(sorted(ordered_nodes))
-    if len(ordered_nodes) < 2:
-        raise ValueError("at least two nodes are required")
-    if isinstance(pair_count, bool) or not isinstance(pair_count, int):
-        raise ValueError("pair_count must be an integer")
-    if pair_count < 0:
-        raise ValueError("pair_count must be non-negative")
+    if set(supplied_nodes) != set(range(len(supplied_nodes))):
+        raise ValueError("nodes must be integer IDs exactly 0 through n-1")
+    ordered_nodes = tuple(range(len(supplied_nodes)))
     _validate_seed(seed)
-
-    node_count = len(ordered_nodes)
-    available_pair_count = node_count * (node_count - 1)
-    if pair_count > available_pair_count:
-        raise ValueError(
-            f"pair_count exceeds the {available_pair_count} available ordered pairs"
-        )
-
-    sampled_indices = Random(seed).sample(range(available_pair_count), pair_count)
-    pairs: list[tuple[int, int]] = []
-    for pair_index in sampled_indices:
-        source_index, destination_offset = divmod(pair_index, node_count - 1)
-        destination_index = (
-            destination_offset
-            if destination_offset < source_index
-            else destination_offset + 1
-        )
-        pairs.append(
-            (ordered_nodes[source_index], ordered_nodes[destination_index])
-        )
-
-    result = tuple(pairs)
-    if len(set(result)) != len(result) or any(source == target for source, target in result):
-        raise RuntimeError("ordered-pair sampler violated uniqueness invariants")
-    return result
+    effective_identity = (
+        f"standalone_pair_sample:n={len(ordered_nodes)}:seed={seed}"
+        if graph_identity is None
+        else graph_identity
+    )
+    return frozen_sample_ordered_pairs(
+        ordered_nodes,
+        pair_count,
+        seed,
+        graph_identity=effective_identity,
+    )
 
 
 def _validate_walk(graph: nx.Graph, result: RoutingResult) -> None:
@@ -361,7 +352,7 @@ def _runtime_metadata() -> tuple[tuple[str, str], ...]:
 
 
 def implementation_source_fingerprint() -> str:
-    """Hash the exact Stage 1-11 implementation used by the smoke run."""
+    """Hash the exact development implementation used by the smoke run."""
 
     code_directory = Path(__file__).resolve().parent
     digest = sha256()
@@ -429,7 +420,16 @@ def run_development_smoke(
             raise RuntimeError("routing metrics did not receive identical coordinates")
         pair_count = min(pair_limit, config.source_destination_pairs_per_graph)
         pairs = sample_ordered_pairs(
-            graph.nodes, pair_count, seeds.source_destination_sampling
+            graph.nodes,
+            pair_count,
+            config.source_destination_sampling_master_seed,
+            graph_identity=frozen_graph_identity(
+                configuration_name=config.name,
+                setting_index=setting_index,
+                setting_label=config.parameter_settings[setting_index].label,
+                model=model,
+                replicate_index=replicate_index,
+            ),
         )
 
         method_records = tuple(
@@ -458,7 +458,15 @@ def run_development_smoke(
                 ),
                 pair_sampling_metadata=_stable_items(
                     {
-                        "algorithm": "python_random_sample_without_replacement_v1",
+                        "algorithm": (
+                            "blake2s_uint64_rejection_without_replacement_v1"
+                        ),
+                        "pair_master_seed": (
+                            config.source_destination_sampling_master_seed
+                        ),
+                        "derived_pair_seed_provenance": (
+                            seeds.source_destination_sampling
+                        ),
                         "source_destination_sampling_seed": (
                             seeds.source_destination_sampling
                         ),

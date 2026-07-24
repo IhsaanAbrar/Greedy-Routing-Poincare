@@ -8,7 +8,7 @@ tie-breaking so that the routing methods are compared on the same inputs.
 
 ## Current status
 
-Development Stages 1-11 are implemented: validated experiment settings,
+Development Stages 1-13 are implemented: validated experiment settings,
 distance and disk utilities, connected ER and BA generation, network metrics,
 embedding distortion, Dijkstra and all three routing variants, deterministic
 pair sampling, and a small integration smoke runner. The approved co-equal
@@ -49,7 +49,7 @@ default NetworkX BA construction, the exact edge count is `m(n - m)`, so
 ```text
 BA exact average degree = 2m(n - m) / n
 ER expected average degree = p(n - 1)
-p = [2m(n - m) / n] / (n - 1).
+p = 2m(n - m) / [n(n - 1)].
 ```
 
 `2m` is only the large-`n` BA approximation. ER samples are retained only when
@@ -58,17 +58,13 @@ That conditioning can shift realised average degree; final comparisons must
 record and analyse measured realised degree rather than relying only on the
 matched expectation.
 
-Graph generation, the development-only force layout, and source-destination
-sampling use separate master-seed streams. Hydra and MDS are deterministic
-given the shared distance-matrix input. Derived 32-bit seeds use versioned,
-domain-separated BLAKE2s experiment identities; Python's process-randomised
-`hash()` is never used. Every configured development and provisional-full seed
-use is checked for collisions. The experiment also fixes node ordering, pair
-ordering, numerical tolerances, and routing tie breaking. Exact settings and
-seed-derivation metadata have canonical JSON serialization and a SHA-256
-configuration fingerprint in `code/experiment_config.py`. Structured smoke
-provenance also records a SHA-256 fingerprint over the exact Stage 1-11 source
-modules.
+Graph generation, embedding provenance, and source-destination sampling use
+separate master-seed streams. Hydra and MDS are deterministic given the shared
+distance-matrix input. Derived seeds and the ordered-pair sampler use versioned,
+domain-separated BLAKE2s identities; Python's process-randomised `hash()` and
+library sampling behaviour are not used. The frozen data-generation,
+analysis-plan, and combined methodology hashes are exposed by
+`code/experiment_config.py`.
 
 Approved experimental graphs use non-boolean integer node IDs from `0` through
 `n - 1`. Low-level embedding fixtures may instead use homogeneous string
@@ -131,14 +127,14 @@ It uses three excluded development graphs and five pairs per graph. It prints
 diagnostics and workload counts, writes no outputs or plots, and does not run
 the full configuration.
 
-The proposed full configuration remains provisional: 9 matched parameter
-settings, 2 graph models, and 20 repetitions produce 360 graphs. At 1,000
+The frozen full configuration has 9 matched parameter settings, 2 graph
+models, and 20 repetitions, producing 360 graphs. At 1,000
 ordered pairs per graph, that is 360,000 Dijkstra runs and 1,800,000 runs of
 each greedy method across the five coordinate conditions: 5,760,000 routing
 executions in total. It also entails 360 Hydra runs, 360 MDS base runs, 1,440
 nested MDS radius transformations, 65,916,000 unordered-pair distortion
-evaluations per condition, and 329,580,000 across all five conditions. The grid
+evaluations per metric condition, and 461,412,000 across the seven prescribed
+metric conditions. The grid
 contains 180 ER and 180 BA replicates; the 50-attempt ER cap implies at most
 9,000 ER candidate draws, or 9,180 total generator calls including one call per
-BA graph. The full experiment must not run until the provisional full settings
-and workload receive explicit approval.
+BA graph.

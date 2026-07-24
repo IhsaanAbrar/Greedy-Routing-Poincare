@@ -27,7 +27,6 @@ from routing import (  # noqa: E402
     LOCAL_MINIMUM,
     REPAIR_FAILED,
     REPAIR_UNAVAILABLE,
-    STEP_LIMIT,
     PreparedRoutingCoordinates,
     RoutingInvariantError,
     RoutingResult,
@@ -605,14 +604,10 @@ class EuclideanGreedyTests(RoutingTestCase):
         graph = nx.path_graph(3)
         coordinates = {0: (-0.6, 0.0), 1: (0.0, 0.0), 2: (0.6, 0.0)}
 
-        result = euclidean_greedy_route(
-            graph, coordinates, 0, 2, step_limit=1
-        )
-
-        self.assertFalse(result.success)
-        self.assertEqual(result.failure_type, STEP_LIMIT)
-        self.assertEqual(result.walk, (0, 1))
-        self.assert_result_invariants(graph, result)
+        with self.assertRaises(RoutingInvariantError):
+            euclidean_greedy_route(
+                graph, coordinates, 0, 2, step_limit=1
+            )
 
     def test_generic_core_is_equivalent_for_equivalent_metrics(self):
         graph = nx.path_graph(3)
@@ -842,25 +837,14 @@ class RepairedHyperbolicGreedyTests(RoutingTestCase):
             4: (0.85, 0.0),
         }
 
-        result = repaired_hyperbolic_greedy_route(
-            graph,
-            coordinates,
-            0,
-            4,
-            step_limit=4,
-        )
-
-        self.assertFalse(result.success)
-        self.assertEqual(result.initial_failure_type, CYCLE)
-        self.assertEqual(result.final_failure_type, STEP_LIMIT)
-        self.assertEqual(result.failure_type, STEP_LIMIT)
-        self.assertTrue(result.repair_attempted)
-        self.assertTrue(result.repair_alternative_existed)
-        self.assertFalse(result.repair_succeeded)
-        self.assertEqual(result.repair_attempt_count, 1)
-        self.assertEqual(result.forwarding_decisions, 4)
-        self.assertEqual(result.walk, (0, 1, 2, 1, 3))
-        self.assert_result_invariants(graph, result)
+        with self.assertRaises(RoutingInvariantError):
+            repaired_hyperbolic_greedy_route(
+                graph,
+                coordinates,
+                0,
+                4,
+                step_limit=4,
+            )
 
     def test_no_repair_needed_matches_ordinary_route(self):
         graph = nx.path_graph(3)
@@ -937,7 +921,10 @@ class RepairedHyperbolicGreedyTests(RoutingTestCase):
 
         self.assertFalse(result.success)
         self.assertEqual(result.initial_failure_type, CYCLE)
-        self.assertEqual(result.final_failure_type, CYCLE)
+        self.assertEqual(
+            result.final_failure_type,
+            "post_repair_attempted_revisit",
+        )
         self.assertEqual(result.repair_attempt_count, 1)
         self.assertTrue(result.repair_alternative_existed)
         self.assertEqual(result.walk, (0, 1, 2, 1, 3))

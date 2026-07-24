@@ -36,6 +36,7 @@ class ClassicalMDSMetadata:
     embedding_family: str
     embedding_version: str
     dimension: int
+    effective_rank: int
     node_order: tuple[Hashable, ...]
     retained_eigenvalues: tuple[float, float]
     eigenvalue_relative_tolerance: float
@@ -50,6 +51,7 @@ class ClassicalMDSMetadata:
     coincident_coordinate_group_count: int
     coincident_vertex_count: int
     coincident_vertex_pair_count: int
+    coincident_coordinate_groups: tuple[tuple[Hashable, ...], ...]
     configuration_fingerprint: str
     embedding_input_fingerprint: str
 
@@ -71,6 +73,7 @@ class MDSConditionMetadata:
     embedding_version: str
     coordinate_condition_id: str
     dimension: int
+    effective_rank: int
     node_order: tuple[Hashable, ...]
     retained_eigenvalues: tuple[float, float]
     canonicalized_eigenspace_group_sizes: tuple[int, ...]
@@ -86,6 +89,7 @@ class MDSConditionMetadata:
     coincident_coordinate_group_count: int
     coincident_vertex_count: int
     coincident_vertex_pair_count: int
+    coincident_coordinate_groups: tuple[tuple[Hashable, ...], ...]
     configuration_fingerprint: str
     embedding_input_fingerprint: str
 
@@ -105,22 +109,27 @@ def _positive_finite(name: str, value: float) -> float:
     return validated
 
 
-def _coincident_coordinate_counts(
+def _coincident_coordinate_metadata(
     coordinates: NDArray[np.float64],
-) -> tuple[int, int, int]:
+    node_order: Sequence[Hashable],
+) -> tuple[int, int, int, tuple[tuple[Hashable, ...], ...]]:
     """Count exact coordinate coincidences without modifying coordinates."""
 
-    group_sizes: dict[tuple[float, float], int] = {}
-    for point in coordinates:
+    groups_by_point: dict[tuple[float, float], list[Hashable]] = {}
+    for node, point in zip(node_order, coordinates, strict=True):
         key = (float(point[0]), float(point[1]))
-        group_sizes[key] = group_sizes.get(key, 0) + 1
-    coincident_sizes = tuple(
-        size for size in group_sizes.values() if size > 1
+        groups_by_point.setdefault(key, []).append(node)
+    groups = tuple(
+        tuple(nodes)
+        for nodes in groups_by_point.values()
+        if len(nodes) > 1
     )
+    coincident_sizes = tuple(len(group) for group in groups)
     return (
         len(coincident_sizes),
         sum(coincident_sizes),
         sum(size * (size - 1) // 2 for size in coincident_sizes),
+        groups,
     )
 
 
@@ -197,16 +206,19 @@ def classical_mds(
     order = np.argsort(-eigenvalues, kind="stable")
     eigenvalues = np.asarray(eigenvalues[order], dtype=np.float64)
     eigenvectors = np.asarray(eigenvectors[:, order], dtype=np.float64)
+    if not np.isfinite(eigenvalues).all():
+        raise ClassicalMDSError("classical MDS eigenvalues are non-finite")
     eigenvalue_scale = max(1.0, float(np.max(np.abs(eigenvalues))))
     absolute_threshold = relative_tolerance * eigenvalue_scale
     positive_indices = np.flatnonzero(eigenvalues > absolute_threshold)
-    if len(positive_indices) < dimension:
+    if len(positive_indices) == 0:
         raise ClassicalMDSError(
-            "classical MDS requires at least two eigenvalues above the "
-            f"positive threshold {absolute_threshold:.17g}"
+            "classical MDS requires at least one eigenvalue above the "
+            f"positive threshold {absolute_threshold:.17g}; rank 0 is unusable"
         )
 
     retained_indices = positive_indices[:dimension]
+    effective_rank = int(len(retained_indices))
     retained_index_tuple = tuple(int(index) for index in retained_indices)
     retained_values = tuple(
         float(eigenvalues[index]) for index in retained_indices
@@ -233,6 +245,10 @@ def classical_mds(
         )
     ]
     coordinates = np.column_stack(columns)
+    if effective_rank == 1:
+        coordinates = np.column_stack(
+            (coordinates[:, 0], np.zeros(point_count, dtype=np.float64))
+        )
     coordinates -= np.mean(coordinates, axis=0)
     centroid = np.mean(coordinates, axis=0)
     centroid_residual = float(np.linalg.norm(centroid))
@@ -245,7 +261,7 @@ def classical_mds(
         )
     norms = np.linalg.norm(coordinates, axis=1)
     maximum_norm = float(np.max(norms))
-    if not isfinite(maximum_norm) or maximum_norm <= absolute_threshold:
+    if not isfinite(maximum_norm) or maximum_norm <= 0.0:
         raise ClassicalMDSError("classical MDS coordinates collapsed")
 
     significant_negative = eigenvalues[eigenvalues < -absolute_threshold]
@@ -258,7 +274,11 @@ def classical_mds(
         coincident_group_count,
         coincident_vertex_count,
         coincident_pair_count,
-    ) = _coincident_coordinate_counts(coordinates)
+        coincident_groups,
+    ) = _coincident_coordinate_metadata(
+        coordinates,
+        embedding_input.node_order,
+    )
     coordinates.setflags(write=False)
     coordinate_mapping = MappingProxyType(
         {
@@ -274,8 +294,12 @@ def classical_mds(
         embedding_family=MDS_EMBEDDING_FAMILY,
         embedding_version=MDS_EMBEDDING_VERSION,
         dimension=MDS_DIMENSION,
+        effective_rank=effective_rank,
         node_order=embedding_input.node_order,
-        retained_eigenvalues=(retained_values[0], retained_values[1]),
+        retained_eigenvalues=(
+            retained_values[0],
+            retained_values[1] if effective_rank == 2 else 0.0,
+        ),
         eigenvalue_relative_tolerance=relative_tolerance,
         eigenvalue_absolute_threshold=absolute_threshold,
         canonicalized_eigenspace_group_sizes=repeated_group_sizes,
@@ -290,6 +314,7 @@ def classical_mds(
         coincident_coordinate_group_count=coincident_group_count,
         coincident_vertex_count=coincident_vertex_count,
         coincident_vertex_pair_count=coincident_pair_count,
+        coincident_coordinate_groups=coincident_groups,
         configuration_fingerprint=embedding_input.configuration_fingerprint,
         embedding_input_fingerprint=embedding_input.input_fingerprint,
     )
@@ -342,7 +367,11 @@ def transform_mds_to_radius(
         coincident_group_count,
         coincident_vertex_count,
         coincident_pair_count,
-    ) = _coincident_coordinate_counts(transformed)
+        coincident_groups,
+    ) = _coincident_coordinate_metadata(
+        transformed,
+        base_embedding.metadata.node_order,
+    )
 
     coordinate_mapping = MappingProxyType(
         {
@@ -362,6 +391,7 @@ def transform_mds_to_radius(
             embedding_version=MDS_EMBEDDING_VERSION,
             coordinate_condition_id=MDS_CONDITION_BY_RADIUS[radius],
             dimension=MDS_DIMENSION,
+            effective_rank=base.effective_rank,
             node_order=base.node_order,
             retained_eigenvalues=base.retained_eigenvalues,
             canonicalized_eigenspace_group_sizes=(
@@ -383,6 +413,7 @@ def transform_mds_to_radius(
             coincident_coordinate_group_count=coincident_group_count,
             coincident_vertex_count=coincident_vertex_count,
             coincident_vertex_pair_count=coincident_pair_count,
+            coincident_coordinate_groups=coincident_groups,
             configuration_fingerprint=base.configuration_fingerprint,
             embedding_input_fingerprint=base.embedding_input_fingerprint,
         ),

@@ -78,6 +78,7 @@ def _stable_record(record):
             replace(diagnostic, transformation_runtime_ns=0)
             for diagnostic in record.condition_diagnostics
         ),
+        record.distortion_diagnostics,
         tuple(
             replace(route_record, runtime_ns=0)
             for route_record in record.route_records
@@ -199,6 +200,21 @@ class ApprovedEmbeddingPipelineTests(unittest.TestCase):
             (HYDRA_CONDITION_ID, *MDS_CONDITION_IDS),
         )
         self.assertEqual(len(record.condition_diagnostics), 5)
+        self.assertEqual(
+            tuple(
+                diagnostic.metric_condition_id
+                for diagnostic in record.distortion_diagnostics
+            ),
+            (
+                "hydra_euclidean",
+                "hydra_poincare",
+                "base_mds_euclidean",
+                "mds_poincare_r050",
+                "mds_poincare_r070",
+                "mds_poincare_r085",
+                "mds_poincare_r095",
+            ),
+        )
         radius_by_condition = {
             diagnostic.coordinate_condition_id: diagnostic.mds_radius
             for diagnostic in record.condition_diagnostics
