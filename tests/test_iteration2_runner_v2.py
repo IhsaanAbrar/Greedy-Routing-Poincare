@@ -18,8 +18,15 @@ sys.path.insert(0, str(PROJECT_ROOT / "tests"))
 
 from benchmark_iteration2_capacity import (  # noqa: E402
     Iteration2CapacityError,
+    dependency_fingerprint,
+    integrity_report,
     load_capacity_profile,
+    performance_source_fingerprint,
+    performance_source_manifest,
+    physical_profile_sha256,
+    profile_sha256,
 )
+from iteration2_config import COMBINED_PROTOCOL_HASH  # noqa: E402
 from iteration2_v2_support import excluded_run_manifest  # noqa: E402
 from iteration2_runtime_guard import (  # noqa: E402
     ANALYSIS_READ_ONLY,
@@ -313,7 +320,9 @@ class Iteration2FutureRunGuardTests(unittest.TestCase):
                     ]
                 )
 
-    def test_repository_profile_is_untracked_and_missing_or_stale_profiles_fail(self):
+    def test_repository_profile_is_tracked_valid_and_invalid_fixtures_fail(self):
+        profile_path = PROJECT_ROOT / "code" / "iteration2_capacity_profile.json"
+        self.assertTrue(profile_path.is_file())
         tracked = subprocess.run(
             [
                 "git",
@@ -326,25 +335,82 @@ class Iteration2FutureRunGuardTests(unittest.TestCase):
             check=False,
             capture_output=True,
         )
-        self.assertNotEqual(tracked.returncode, 0)
+        self.assertEqual(tracked.returncode, 0, tracked.stderr.decode())
+        self.assertEqual(
+            tracked.stdout.decode().strip().replace("\\", "/"),
+            "code/iteration2_capacity_profile.json",
+        )
+        unchanged = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--quiet",
+                "HEAD",
+                "--",
+                "code/iteration2_capacity_profile.json",
+            ],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+        )
+        self.assertEqual(unchanged.returncode, 0, unchanged.stderr.decode())
+
+        profile = load_capacity_profile(profile_path, root=PROJECT_ROOT)
+        report = integrity_report(profile_path)
+        self.assertTrue(report["valid"])
+        self.assertEqual(profile["profile_sha256"], profile_sha256(profile))
+        self.assertEqual(report["internal_sha256"], profile["profile_sha256"])
+        self.assertEqual(
+            report["physical_sha256"],
+            physical_profile_sha256(profile_path),
+        )
+        self.assertEqual(profile["protocol_hash"], COMBINED_PROTOCOL_HASH)
+        self.assertEqual(
+            profile["dependency_fingerprint"],
+            dependency_fingerprint(PROJECT_ROOT),
+        )
+        self.assertEqual(
+            profile["performance_source_manifest"],
+            performance_source_manifest(PROJECT_ROOT),
+        )
+        self.assertEqual(
+            profile["performance_source_fingerprint"],
+            performance_source_fingerprint(PROJECT_ROOT),
+        )
+
         with TemporaryDirectory(prefix="iteration2-capacity-guards-") as temporary:
             fixture_root = Path(temporary)
-            stale = fixture_root / "stale-v1.json"
+            stale = fixture_root / "stale-source-manifest.json"
+            stale_profile = deepcopy(profile)
+            stale_profile["performance_source_manifest"]["files"][
+                "requirements.txt"
+            ] = "0" * 64
+            stale_profile["profile_sha256"] = profile_sha256(stale_profile)
             stale.write_text(
                 json.dumps(
-                    {
-                        "profile_schema": (
-                            "greedy_routing_iteration2_capacity_profile_v1"
-                        )
-                    }
-                ),
+                    stale_profile,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+                + "\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(
                 Iteration2CapacityError,
-                "schema mismatch",
+                "performance source manifest mismatch",
             ):
                 load_capacity_profile(stale, root=PROJECT_ROOT)
+
+            corrupt = fixture_root / "corrupt.json"
+            corrupt.write_text('{"profile_schema":', encoding="utf-8")
+            with self.assertRaisesRegex(
+                Iteration2CapacityError,
+                "profile JSON is invalid",
+            ):
+                load_capacity_profile(corrupt, root=PROJECT_ROOT)
+
             with self.assertRaisesRegex(
                 Iteration2CapacityError,
                 "profile is missing",
