@@ -41,10 +41,10 @@ from iteration2_config import (
     GRAPH_MODELS,
     GRAPH_REPETITIONS,
     ITERATION2_CAPACITY_PROFILE_SCHEMA,
-    ITERATION2_ANALYSIS_IDENTITY,
     ITERATION2_GRAPH_COUNT,
     ITERATION2_OUTPUT_SCHEMA,
     ITERATION2_RESULT_SCHEMA,
+    ITERATION2_RUN_IDENTITY,
     MATCHED_CONDITIONS,
     N_VALUES,
     OUTPUT_SCHEMA_HASH,
@@ -52,7 +52,13 @@ from iteration2_config import (
     full_schedule,
     seeds_for_graph,
 )
+from iteration2_excluded import ExcludedAnalysisFixtureContract
 from iteration2_experiment import execute_iteration2_graph
+from iteration2_runtime_guard import (
+    PREFLIGHT_READ_ONLY,
+    require_zero_scientific_operations,
+    scientific_operation_context,
+)
 from iteration2_reporting import (
     FIGURE_FILES,
     WORKBOOK_SHEETS,
@@ -537,6 +543,39 @@ def benchmark_specs() -> tuple[BenchmarkSpec, ...]:
     return tuple(specs)
 
 
+def excluded_capacity_contract() -> ExcludedAnalysisFixtureContract:
+    """Return the canonical non-scientific contract for this benchmark."""
+
+    specs = benchmark_specs()
+    return ExcludedAnalysisFixtureContract(
+        fixture_tag="capacity_benchmark",
+        expected_graph_ids=tuple(spec.graph_id for spec in specs),
+        excluded_seeds=tuple(
+            seed
+            for spec in specs
+            for seed in (spec.graph_seed, spec.pair_seed)
+        ),
+        pair_count=PAIRS_PER_GRAPH,
+        bootstrap_replicates=1,
+        property_resampling_replicates=1,
+        permutation_replicates=1,
+    )
+
+
+def excluded_capacity_identity() -> dict[str, object]:
+    """Return the canonical non-scientific identity for this benchmark."""
+
+    contract = excluded_capacity_contract()
+    return {
+        "payload": dict(contract.payload),
+        "payload_sha256": contract.payload_hash,
+        "raw_identity": contract.raw_identity,
+        "analysis_identity": contract.analysis_identity,
+        "scientific_status": "excluded_non_scientific",
+        "production_compatible": False,
+    }
+
+
 def validate_benchmark_domains() -> None:
     schedule = full_schedule()
     scientific_ids = {spec.graph_id for spec in schedule}
@@ -564,6 +603,18 @@ def validate_benchmark_domains() -> None:
         )
     if any(not graph_id.startswith("excluded_i2_capacity_") for graph_id in identities):
         raise Iteration2CapacityError("capacity benchmark identity is not excluded")
+    excluded_identity = excluded_capacity_identity()
+    if (
+        excluded_identity["raw_identity"] == ITERATION2_RUN_IDENTITY
+        or not str(excluded_identity["raw_identity"]).startswith(
+            "iteration2_excluded_raw_"
+        )
+        or excluded_identity["scientific_status"] != "excluded_non_scientific"
+        or excluded_identity["production_compatible"] is not False
+    ):
+        raise Iteration2CapacityError(
+            "capacity benchmark raw identity is not excluded"
+        )
 
 
 def frozen_workload() -> dict[str, object]:
@@ -646,6 +697,7 @@ def _records_by_cell(
                 )
         expected_oracle = role == MEASURED_ORACLE_ROLE
         expected_pairs_checked = PAIRS_PER_GRAPH if expected_oracle else 5
+        excluded_identity = excluded_capacity_identity()
         if (
             record.get("pair_count") != PAIRS_PER_GRAPH
             or record.get("route_record_count")
@@ -662,6 +714,9 @@ def _records_by_cell(
             or record.get("checkpoint_validation_passed") is not True
             or record.get("temporary_output_removed") is not True
             or record.get("scientific_result_created") is not False
+            or record.get("run_identity") != excluded_identity["raw_identity"]
+            or record.get("scientific_status")
+            != excluded_identity["scientific_status"]
         ):
             raise Iteration2CapacityError(
                 "capacity repetition did not exercise the frozen workload"
@@ -886,6 +941,7 @@ def build_profile(
         "environment_compatibility": environment_identity(),
         "workload": frozen_workload(),
         "benchmark_graphs": [spec.identity() for spec in benchmark_specs()],
+        "excluded_benchmark_identity": excluded_capacity_identity(),
         "repetition_policy": {
             "roles": list(REPETITION_ROLES),
             "warmup_in_projection": False,
@@ -974,6 +1030,10 @@ def validate_capacity_profile(
             profile.get("benchmark_graphs"),
             [spec.identity() for spec in benchmark_specs()],
         ),
+        "excluded benchmark identity": (
+            profile.get("excluded_benchmark_identity"),
+            excluded_capacity_identity(),
+        ),
     }
     for label, (observed, expected) in expected_identities.items():
         if observed != expected:
@@ -1000,12 +1060,27 @@ def validate_capacity_profile(
     if (
         publication.get("temporary_output_removed") is not True
         or publication.get("scientific_result_created") is not False
+        or publication.get("run_identity")
+        != excluded_capacity_identity()["raw_identity"]
+        or publication.get("analysis_identity")
+        != excluded_capacity_identity()["analysis_identity"]
+        or publication.get("scientific_status") != "excluded_non_scientific"
+        or publication.get("production_compatible") is not False
         or publication.get("workbook_sheet_count") != len(WORKBOOK_SHEETS)
         or publication.get("figure_count") != len(FIGURE_FILES)
     ):
         raise Iteration2CapacityError(
             "capacity publication proxy is incomplete"
         )
+    ledger_snapshot = publication.get("scientific_operation_ledger")
+    if not isinstance(ledger_snapshot, Mapping):
+        raise Iteration2CapacityError(
+            "capacity publication proxy ledger is missing"
+        )
+    require_zero_scientific_operations(
+        ledger_snapshot,
+        context="Iteration 2 capacity publication proxy",
+    )
     for key in (
         "end_to_end_ns",
         "machine_readable_bytes",
@@ -1208,6 +1283,7 @@ def _worker_record(
         raise Iteration2CapacityError("unknown benchmark repetition role")
     root = _verified_worker_root(temporary_root)
     full_oracle = role == MEASURED_ORACLE_ROLE
+    excluded_identity = excluded_capacity_identity()
     total_started = perf_counter_ns()
     print("CAPACITY_WORKER graph_generation_started", flush=True)
     generated = _generate_graph(spec)
@@ -1226,9 +1302,18 @@ def _worker_record(
         embedding_provenance_seed=None,
         generation_metadata=generated.metadata,
         audit_all_pairs=full_oracle,
+        run_identity=str(excluded_identity["raw_identity"]),
     )
     graph_execution_ns = perf_counter_ns() - execution_started
     validate_iteration2_graph_result(result)
+    if (
+        result.get("run_identity") != excluded_identity["raw_identity"]
+        or result.get("scientific_status")
+        != excluded_identity["scientific_status"]
+    ):
+        raise Iteration2CapacityError(
+            "benchmark execution did not retain its excluded identity"
+        )
     print("CAPACITY_WORKER serialization_started", flush=True)
     serialization_started = perf_counter_ns()
     plain = _json_bytes(result)
@@ -1266,6 +1351,8 @@ def _worker_record(
     end_to_end_ns = perf_counter_ns() - total_started
     record = {
         **spec.identity(),
+        "run_identity": result["run_identity"],
+        "scientific_status": result["scientific_status"],
         "repetition_role": role,
         "warmup": role == WARMUP_ROLE,
         "included_in_runtime_projection": role != WARMUP_ROLE,
@@ -1445,19 +1532,38 @@ def run_publication_proxy() -> dict[str, object]:
         raise Iteration2CapacityError(
             "publication proxy is outside the temporary root"
         ) from exc
-    output = root / ITERATION2_ANALYSIS_IDENTITY
+    excluded_identity = excluded_capacity_identity()
+    output = root / str(excluded_identity["analysis_identity"])
     started = perf_counter_ns()
     try:
-        manifest = build_reporting_bundle(
-            output,
-            tables=_publication_tables(),
-            source_commit="0" * 40,
-            raw_location="excluded/non-scientific/capacity",
-            raw_file_hashes={"excluded-capacity.json.gz": "0" * 64},
-            limitations=(
-                "Excluded structural capacity proxy; no routing outcomes.",
-            ),
-        )
+        with scientific_operation_context(PREFLIGHT_READ_ONLY) as ledger:
+            initial_ledger = ledger.snapshot()
+            manifest = build_reporting_bundle(
+                output,
+                tables=_publication_tables(),
+                source_commit="0" * 40,
+                raw_location="excluded/non-scientific/capacity",
+                raw_file_hashes={"excluded-capacity.json.gz": "0" * 64},
+                raw_generation_identity={
+                    "run_identity": excluded_identity["raw_identity"],
+                    "scientific_status": excluded_identity[
+                        "scientific_status"
+                    ],
+                    "production_compatible": False,
+                },
+                analysis_validation_evidence={
+                    "scientific_operation_ledger": initial_ledger,
+                },
+                excluded_fixture_payload=excluded_identity["payload"],
+                limitations=(
+                    "Excluded structural capacity proxy; no routing outcomes.",
+                ),
+            )
+            final_ledger = ledger.snapshot()
+            require_zero_scientific_operations(
+                final_ledger,
+                context="Iteration 2 capacity publication proxy",
+            )
         sizes = _tree_sizes(output)
         workbook = sizes.get("iteration2_results.xlsx", 0)
         figures = sum(
@@ -1475,6 +1581,11 @@ def run_publication_proxy() -> dict[str, object]:
                 "publication proxy did not create the complete reporting bundle"
             )
         record = {
+            "run_identity": excluded_identity["raw_identity"],
+            "analysis_identity": excluded_identity["analysis_identity"],
+            "scientific_status": excluded_identity["scientific_status"],
+            "production_compatible": False,
+            "scientific_operation_ledger": final_ledger,
             "end_to_end_ns": perf_counter_ns() - started,
             "file_count": len(sizes),
             "machine_readable_bytes": machine,

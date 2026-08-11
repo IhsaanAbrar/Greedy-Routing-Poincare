@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -51,6 +52,10 @@ from iteration2_config import (  # noqa: E402
     output_schema_payload,
     sample_ordered_pairs,
     seeds_for_graph,
+)
+from iteration2_runtime_guard import (  # noqa: E402
+    PREFLIGHT_READ_ONLY,
+    ScientificOperationLedger,
 )
 from iteration2_excluded import ExcludedAnalysisFixtureContract  # noqa: E402
 from iteration2_v2_support import (  # noqa: E402
@@ -443,6 +448,10 @@ class Iteration2CapacityProfileTests(unittest.TestCase):
                 records.append(
                     {
                         **spec.identity(),
+                        "run_identity": iteration2_capacity.excluded_capacity_identity()[
+                            "raw_identity"
+                        ],
+                        "scientific_status": "excluded_non_scientific",
                         "repetition_role": role,
                         "warmup": role == iteration2_capacity.WARMUP_ROLE,
                         "included_in_runtime_projection": (
@@ -487,7 +496,14 @@ class Iteration2CapacityProfileTests(unittest.TestCase):
 
     @staticmethod
     def _publication() -> dict[str, object]:
+        excluded_identity = iteration2_capacity.excluded_capacity_identity()
+        ledger = ScientificOperationLedger(mode=PREFLIGHT_READ_ONLY).snapshot()
         return {
+            "run_identity": excluded_identity["raw_identity"],
+            "analysis_identity": excluded_identity["analysis_identity"],
+            "scientific_status": "excluded_non_scientific",
+            "production_compatible": False,
+            "scientific_operation_ledger": ledger,
             "end_to_end_ns": 5_000_000,
             "file_count": 30,
             "machine_readable_bytes": 100_000,
@@ -555,6 +571,10 @@ class Iteration2CapacityProfileTests(unittest.TestCase):
                 {"versions": {}, "sha256": "0" * 64},
             ),
             "output-schema hash": ("output_schema_hash", "0" * 64),
+            "excluded benchmark identity": (
+                "excluded_benchmark_identity",
+                {"raw_identity": "iteration2_raw_invalid"},
+            ),
         }
         for expected_message, (key, replacement) in mutations.items():
             with self.subTest(identity=key):
@@ -643,6 +663,17 @@ class Iteration2CapacityProfileTests(unittest.TestCase):
 
     def test_excluded_benchmark_domains_and_profile_forbid_scientific_results(self):
         iteration2_capacity.validate_benchmark_domains()
+        excluded_identity = iteration2_capacity.excluded_capacity_identity()
+        self.assertTrue(
+            str(excluded_identity["raw_identity"]).startswith(
+                "iteration2_excluded_raw_"
+            )
+        )
+        self.assertEqual(
+            excluded_identity["scientific_status"],
+            "excluded_non_scientific",
+        )
+        self.assertFalse(excluded_identity["production_compatible"])
         scientific_ids = {spec.graph_id for spec in full_schedule()}
         self.assertTrue(
             scientific_ids.isdisjoint(
@@ -654,6 +685,50 @@ class Iteration2CapacityProfileTests(unittest.TestCase):
         self.assertFalse(
             iteration2_capacity._forbidden_keys(profile)
         )
+
+    def test_worker_passes_canonical_excluded_raw_identity_to_execution(self):
+        spec = iteration2_capacity.benchmark_specs()[0]
+        generated = SimpleNamespace(graph=object(), metadata={})
+        with TemporaryDirectory() as temporary:
+            with (
+                patch.object(
+                    iteration2_capacity,
+                    "_generate_graph",
+                    return_value=generated,
+                ),
+                patch.object(
+                    iteration2_capacity,
+                    "execute_iteration2_graph",
+                    side_effect=RuntimeError("identity captured"),
+                ) as execute,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity captured"):
+                    iteration2_capacity._worker_record(
+                        spec,
+                        iteration2_capacity.WARMUP_ROLE,
+                        temporary,
+                    )
+        self.assertEqual(
+            execute.call_args.kwargs["run_identity"],
+            iteration2_capacity.excluded_capacity_identity()["raw_identity"],
+        )
+
+    def test_real_publication_proxy_is_excluded_measured_and_cleaned(self):
+        record = iteration2_capacity.run_publication_proxy()
+        excluded_identity = iteration2_capacity.excluded_capacity_identity()
+        self.assertEqual(record["run_identity"], excluded_identity["raw_identity"])
+        self.assertEqual(
+            record["analysis_identity"],
+            excluded_identity["analysis_identity"],
+        )
+        self.assertEqual(record["scientific_status"], "excluded_non_scientific")
+        self.assertFalse(record["production_compatible"])
+        self.assertEqual(
+            record["scientific_operation_ledger"]["total_attempted"],
+            0,
+        )
+        self.assertTrue(record["temporary_output_removed"])
+        self.assertFalse(record["scientific_result_created"])
 
     def test_mocked_benchmark_creates_only_profile_not_scientific_results(self):
         records = iter(self._records())

@@ -5,6 +5,7 @@ from copy import deepcopy
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -312,9 +313,20 @@ class Iteration2FutureRunGuardTests(unittest.TestCase):
                     ]
                 )
 
-    def test_repository_profile_is_absent_and_missing_or_stale_profiles_fail(self):
-        profile = PROJECT_ROOT / "code" / "iteration2_capacity_profile.json"
-        self.assertFalse(profile.exists())
+    def test_repository_profile_is_untracked_and_missing_or_stale_profiles_fail(self):
+        tracked = subprocess.run(
+            [
+                "git",
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                "code/iteration2_capacity_profile.json",
+            ],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+        )
+        self.assertNotEqual(tracked.returncode, 0)
         with TemporaryDirectory(prefix="iteration2-capacity-guards-") as temporary:
             fixture_root = Path(temporary)
             stale = fixture_root / "stale-v1.json"
