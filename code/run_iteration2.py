@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
+import errno
 import gzip
 import json
 import math
 import os
 from pathlib import Path
+import shutil
+import socket
+import stat
 import subprocess
-from typing import Mapping, Sequence
+from threading import Lock
+from typing import Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from benchmark_iteration2_capacity import (
@@ -94,6 +100,251 @@ FIXTURE_LABEL = (
     "NON-SCIENTIFIC ITERATION 2 FEASIBILITY FIXTURE - EXCLUDED FROM RESULTS"
 )
 CAPACITY_PROFILE_RELATIVE_PATH = Path("code/iteration2_capacity_profile.json")
+RUN_LEASE_SCHEMA = "greedy_routing_iteration2_run_lease"
+RUN_LEASE_VERSION = 1
+RUN_LEASE_ERROR_CODE = "iteration2_run_already_active"
+RUN_LEASE_FILENAME_SUFFIX = ".lease"
+_RUN_LEASE_REGISTRY_GUARD = Lock()
+_ACTIVE_RUN_LEASES: set[str] = set()
+
+
+class Iteration2RunAlreadyActive(RuntimeError):
+    """Raised when another thread or process owns the requested run lease."""
+
+    def __init__(self, *, run_identity: str, lock_path: Path) -> None:
+        self.run_identity = run_identity
+        self.lock_path = lock_path
+        super().__init__(f"Iteration 2 run already active: {run_identity}")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "code": RUN_LEASE_ERROR_CODE,
+            "message": str(self),
+            "run_identity": self.run_identity,
+            "lock_path": str(self.lock_path),
+        }
+
+
+def _path_is_reparse_point(path: Path) -> bool:
+    """Return true for symbolic links, junctions, and other Windows reparses."""
+
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+    try:
+        attributes = int(getattr(path.lstat(), "st_file_attributes", 0))
+    except FileNotFoundError:
+        return False
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def iteration2_run_lease_path(
+    root: Path | str,
+    run_identity: str,
+) -> Path:
+    """Return the contained persistent lock-file path for one run identity."""
+
+    if (
+        not run_identity
+        or len(run_identity) > 200
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789_-"
+            for character in run_identity
+        )
+    ):
+        raise ValueError("run identity is unsafe for an Iteration 2 lease path")
+    project = Path(root).resolve(strict=True)
+    results_root = project / "results"
+    lock_path = results_root / f".{run_identity}{RUN_LEASE_FILENAME_SUFFIX}"
+    if lock_path.parent != results_root:
+        raise RuntimeError("Iteration 2 lease path escaped the results root")
+    return lock_path
+
+
+def _prepare_run_lease_path(lock_path: Path) -> None:
+    results_root = lock_path.parent
+    if results_root.exists():
+        if _path_is_reparse_point(results_root) or not results_root.is_dir():
+            raise RuntimeError("Iteration 2 lease parent is unsafe")
+    else:
+        results_root.mkdir(mode=0o700, exist_ok=True)
+    if _path_is_reparse_point(results_root) or not results_root.is_dir():
+        raise RuntimeError("Iteration 2 lease parent is unsafe")
+    if _path_is_reparse_point(lock_path) or (
+        lock_path.exists() and not lock_path.is_file()
+    ):
+        raise RuntimeError("Iteration 2 lease file is unsafe")
+
+
+def _open_run_lease_file(lock_path: Path):
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= int(getattr(os, "O_BINARY", 0))
+    flags |= int(getattr(os, "O_NOINHERIT", 0))
+    flags |= int(getattr(os, "O_CLOEXEC", 0))
+    flags |= int(getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        path_status = lock_path.lstat()
+        descriptor_status = os.fstat(descriptor)
+        if (
+            _path_is_reparse_point(lock_path)
+            or not stat.S_ISREG(path_status.st_mode)
+            or not stat.S_ISREG(descriptor_status.st_mode)
+            or not os.path.samestat(path_status, descriptor_status)
+        ):
+            raise RuntimeError("Iteration 2 lease file is unsafe")
+        return os.fdopen(descriptor, "r+b", buffering=0)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _try_os_lock(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_os_lock(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _is_lock_contention(exc: OSError) -> bool:
+    return exc.errno in (errno.EACCES, errno.EAGAIN) or getattr(
+        exc, "winerror", None
+    ) in (32, 33, 36)
+
+
+class _Iteration2RunLease:
+    """Keep one OS lock and its in-process registry claim alive."""
+
+    def __init__(
+        self,
+        *,
+        root: Path | str,
+        run_identity: str,
+        source_commit: str,
+        resume: bool,
+    ) -> None:
+        self.run_identity = run_identity
+        self.path = iteration2_run_lease_path(root, run_identity)
+        self.metadata = {
+            "schema": RUN_LEASE_SCHEMA,
+            "version": RUN_LEASE_VERSION,
+            "run_identity": run_identity,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "source_commit": str(source_commit),
+            "acquired_at_utc": datetime.now(timezone.utc).isoformat(),
+            "resume": bool(resume),
+        }
+        self._registry_key = (
+            str(self.path).casefold() if os.name == "nt" else str(self.path)
+        )
+        self._handle = None
+        self._registry_claimed = False
+
+    def acquire(self) -> "_Iteration2RunLease":
+        with _RUN_LEASE_REGISTRY_GUARD:
+            if self._registry_key in _ACTIVE_RUN_LEASES:
+                raise Iteration2RunAlreadyActive(
+                    run_identity=self.run_identity,
+                    lock_path=self.path,
+                )
+            _ACTIVE_RUN_LEASES.add(self._registry_key)
+            self._registry_claimed = True
+        try:
+            _prepare_run_lease_path(self.path)
+            handle = _open_run_lease_file(self.path)
+            try:
+                if (
+                    _path_is_reparse_point(self.path.parent)
+                    or not self.path.parent.is_dir()
+                ):
+                    raise RuntimeError("Iteration 2 lease parent became unsafe")
+                _try_os_lock(handle)
+            except OSError as exc:
+                handle.close()
+                if _is_lock_contention(exc):
+                    raise Iteration2RunAlreadyActive(
+                        run_identity=self.run_identity,
+                        lock_path=self.path,
+                    ) from exc
+                raise
+            except BaseException:
+                handle.close()
+                raise
+            self._handle = handle
+            try:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(_json_bytes(self.metadata) + b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            except BaseException:
+                self.release()
+                raise
+            return self
+        except BaseException:
+            if self._registry_claimed:
+                with _RUN_LEASE_REGISTRY_GUARD:
+                    _ACTIVE_RUN_LEASES.discard(self._registry_key)
+                self._registry_claimed = False
+            raise
+
+    def release(self) -> None:
+        handle = self._handle
+        self._handle = None
+        try:
+            if handle is not None:
+                try:
+                    _release_os_lock(handle)
+                finally:
+                    handle.close()
+        finally:
+            if self._registry_claimed:
+                with _RUN_LEASE_REGISTRY_GUARD:
+                    _ACTIVE_RUN_LEASES.discard(self._registry_key)
+                self._registry_claimed = False
+
+
+@contextmanager
+def acquire_iteration2_run_lease(
+    *,
+    root: Path | str,
+    run_identity: str,
+    source_commit: str,
+    resume: bool,
+) -> Iterator[_Iteration2RunLease]:
+    """Acquire a non-blocking process-wide and run-wide exclusive lease."""
+
+    lease = _Iteration2RunLease(
+        root=root,
+        run_identity=run_identity,
+        source_commit=source_commit,
+        resume=resume,
+    ).acquire()
+    try:
+        yield lease
+    finally:
+        lease.release()
 
 
 class ResumeValidationPolicy(Enum):
@@ -587,6 +838,29 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _cleanup_owned_checkpoint_staging(
+    temporary: Path,
+    *,
+    root: Path,
+    graph_id: str,
+) -> None:
+    """Remove only the uniquely named same-parent staging directory we own."""
+
+    expected_prefix = f".{graph_id}.tmp-"
+    if (
+        temporary.parent != root
+        or not temporary.name.startswith(expected_prefix)
+        or len(temporary.name) != len(expected_prefix) + 32
+    ):
+        raise RuntimeError("refusing to clean an unowned checkpoint staging path")
+    if _path_is_reparse_point(temporary):
+        raise RuntimeError("refusing to clean a reparse-point checkpoint staging path")
+    if temporary.exists():
+        if not temporary.is_dir():
+            raise RuntimeError("checkpoint staging path changed type")
+        shutil.rmtree(temporary)
+
+
 @scientific_operation_boundary("raw_checkpoint_construction")
 def _construct_raw_checkpoint_payload(
     result: Mapping[str, object],
@@ -603,9 +877,16 @@ def publish_graph_checkpoint(
 ) -> Path:
     """Publish one complete checkpoint by same-parent atomic directory rename."""
 
-    root = Path(graph_root).resolve(strict=True)
-    if root.is_symlink() or not root.is_dir():
+    graph_root_path = Path(graph_root)
+    if _path_is_reparse_point(graph_root_path) or not graph_root_path.is_dir():
         raise RuntimeError("graph checkpoint root is unsafe")
+    root = graph_root_path.resolve(strict=True)
+    if (
+        _path_is_reparse_point(graph_root_path)
+        or not root.is_dir()
+        or not os.path.samestat(graph_root_path.stat(), root.stat())
+    ):
+        raise RuntimeError("graph checkpoint root became unsafe")
     identity = result.get("graph_identity")
     if not isinstance(identity, Mapping):
         raise RuntimeError("checkpoint result graph identity is missing")
@@ -618,17 +899,22 @@ def publish_graph_checkpoint(
         raise RuntimeError("checkpoint graph identity is outside the run schedule")
     validate_iteration2_graph_result(result)
     target = root / graph_id
-    if target.exists():
+    if target.exists() or _path_is_reparse_point(target):
         raise FileExistsError(f"graph checkpoint already exists: {graph_id}")
     temporary = root / f".{graph_id}.tmp-{uuid4().hex}"
-    temporary.mkdir()
-    if temporary.parent != target.parent:
-        raise RuntimeError("checkpoint staging directory is not a same-parent sibling")
-    payload_json, payload_gzip = _construct_raw_checkpoint_payload(result)
-    payload_path = temporary / GRAPH_RESULT_FILENAME
-    manifest_path = temporary / GRAPH_MANIFEST_FILENAME
-    completion_path = temporary / GRAPH_COMPLETION_FILENAME
+    temporary_created = False
+    published = False
     try:
+        temporary.mkdir()
+        temporary_created = True
+        if temporary.parent != target.parent:
+            raise RuntimeError(
+                "checkpoint staging directory is not a same-parent sibling"
+            )
+        payload_json, payload_gzip = _construct_raw_checkpoint_payload(result)
+        payload_path = temporary / GRAPH_RESULT_FILENAME
+        manifest_path = temporary / GRAPH_MANIFEST_FILENAME
+        completion_path = temporary / GRAPH_COMPLETION_FILENAME
         _write_new(payload_path, payload_gzip)
         checkpoint_manifest = {
             "schema": GRAPH_CHECKPOINT_MANIFEST_SCHEMA,
@@ -679,10 +965,15 @@ def publish_graph_checkpoint(
             raise RuntimeError("staged checkpoint file inventory is invalid")
         _fsync_directory(temporary)
         os.replace(temporary, target)
+        published = True
         _fsync_directory(root)
-    except Exception:
-        # Preserve an incomplete staging directory as explicit failure evidence.
-        raise
+    finally:
+        if temporary_created and not published and temporary.exists():
+            _cleanup_owned_checkpoint_staging(
+                temporary,
+                root=root,
+                graph_id=graph_id,
+            )
     return target
 
 
@@ -693,12 +984,19 @@ def validate_checkpoint_directory(
 ) -> dict[str, object]:
     """Read and structurally validate one atomically published checkpoint."""
 
-    directory = Path(checkpoint).resolve(strict=True)
-    if not directory.is_dir() or directory.is_symlink():
+    checkpoint_path = Path(checkpoint)
+    if _path_is_reparse_point(checkpoint_path) or not checkpoint_path.is_dir():
         raise RuntimeError("graph checkpoint must be a non-symlink directory")
+    directory = checkpoint_path.resolve(strict=True)
+    if (
+        _path_is_reparse_point(checkpoint_path)
+        or not directory.is_dir()
+        or not os.path.samestat(checkpoint_path.stat(), directory.stat())
+    ):
+        raise RuntimeError("graph checkpoint became unsafe")
     entries = tuple(directory.iterdir())
-    if any(entry.is_symlink() for entry in entries):
-        raise RuntimeError("graph checkpoint contains a symbolic link")
+    if any(_path_is_reparse_point(entry) for entry in entries):
+        raise RuntimeError("graph checkpoint contains a link or reparse point")
     if any(not entry.is_file() for entry in entries):
         raise RuntimeError("graph checkpoint contains a nested directory")
     observed_files = {entry.name for entry in entries}
@@ -887,14 +1185,21 @@ def _validate_resume_directory(
 
     if validation_policy is not ResumeValidationPolicy.READ_ONLY_STRUCTURAL:
         raise ValueError("resume validation must be structurally read-only")
-    output = Path(output).resolve(strict=True)
-    if not output.is_dir() or output.is_symlink():
+    output_path = Path(output)
+    if _path_is_reparse_point(output_path) or not output_path.is_dir():
         raise RuntimeError("resume output must be a non-symlink directory")
+    output = output_path.resolve(strict=True)
+    if (
+        _path_is_reparse_point(output_path)
+        or not output.is_dir()
+        or not os.path.samestat(output_path.stat(), output.stat())
+    ):
+        raise RuntimeError("resume output became unsafe")
     manifest_path = output / "run_manifest.json"
     if not manifest_path.is_file():
         raise RuntimeError("resume manifest is missing")
     graph_root = output / "graphs"
-    if not graph_root.is_dir() or graph_root.is_symlink():
+    if not graph_root.is_dir() or _path_is_reparse_point(graph_root):
         raise RuntimeError("resume graph checkpoint directory is missing or unsafe")
     direct_graph_files = [path.name for path in graph_root.iterdir() if path.is_file()]
     if direct_graph_files:
@@ -911,8 +1216,10 @@ def _validate_resume_directory(
     schedule = tuple(str(item) for item in current_manifest["schedule"])
     if set(specifications) != set(schedule) or len(schedule) != len(specifications):
         raise RuntimeError("resume manifest schedule is not the frozen schedule")
-    if any(path.is_symlink() for path in (output, *output.rglob("*"))):
-        raise RuntimeError("resume directory contains a symbolic link")
+    if any(
+        _path_is_reparse_point(path) for path in (output, *output.rglob("*"))
+    ):
+        raise RuntimeError("resume directory contains a link or reparse point")
     output_files = {path.name for path in output.iterdir() if path.is_file()}
     unexpected_root_files = output_files - {"run_manifest.json", "run_complete.json"}
     if unexpected_root_files:
@@ -1063,7 +1370,7 @@ def _recheck_execution_authorization(
     verify_iteration1_immutable(root, deep=True)
 
 
-def execute_full_run(
+def _execute_full_run_with_lease_held(
     *,
     mode: str,
     confirmation: str | None,
@@ -1229,6 +1536,39 @@ def execute_full_run(
     ):
         raise RuntimeError("Iteration 2 final completion validation failed")
     return completed
+
+
+def execute_full_run(
+    *,
+    mode: str,
+    confirmation: str | None,
+    expected_source_commit: str | None,
+    expected_source_fingerprint: str | None,
+    expected_dependency_fingerprint: str | None,
+    expected_capacity_profile: str | None,
+    expected_protocol_hash: str | None,
+    resume: bool,
+) -> int:
+    """Own the run-wide lease for authorization, execution, and completion."""
+
+    root = repository_root()
+    source_commit = _git_state(root)[0]
+    with acquire_iteration2_run_lease(
+        root=root,
+        run_identity=ITERATION2_RUN_IDENTITY,
+        source_commit=source_commit,
+        resume=resume,
+    ):
+        return _execute_full_run_with_lease_held(
+            mode=mode,
+            confirmation=confirmation,
+            expected_source_commit=expected_source_commit,
+            expected_source_fingerprint=expected_source_fingerprint,
+            expected_dependency_fingerprint=expected_dependency_fingerprint,
+            expected_capacity_profile=expected_capacity_profile,
+            expected_protocol_hash=expected_protocol_hash,
+            resume=resume,
+        )
 
 
 @scientific_operation_boundary("excluded_fixture_execution")
@@ -1438,6 +1778,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_protocol_hash=args.expected_protocol_hash,
             resume=args.resume,
         )
+    except Iteration2RunAlreadyActive as exc:
+        print(
+            json.dumps(
+                {"authorized": False, "error": exc.as_dict()},
+                sort_keys=True,
+            )
+        )
+        return 3
     except RuntimeError as exc:
         print(json.dumps({"authorized": False, "error": str(exc)}, sort_keys=True))
         return 2

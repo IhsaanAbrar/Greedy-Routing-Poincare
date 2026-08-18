@@ -8,6 +8,7 @@ import json
 from math import isfinite
 from pathlib import Path
 import re
+import stat
 from typing import Iterable
 
 from iteration2_runtime_guard import scientific_operation_boundary
@@ -1066,10 +1067,28 @@ def resolve_iteration2_output(
         r"iteration2_excluded_(?:raw|analysis)_[0-9a-f]{16}", name
     ) is None:
         raise ValueError("output name is not a frozen Iteration 2 identity")
-    target = (root / "results" / name).resolve()
+    results_root = root / "results"
+    target = results_root / name
+    for candidate in (results_root, target):
+        if candidate.is_symlink():
+            raise RuntimeError("Iteration 2 output path contains a symbolic link")
+        is_junction = getattr(candidate, "is_junction", None)
+        if is_junction is not None and is_junction():
+            raise RuntimeError("Iteration 2 output path contains a junction")
+        try:
+            attributes = int(
+                getattr(candidate.lstat(), "st_file_attributes", 0)
+            )
+        except FileNotFoundError:
+            continue
+        reparse_flag = int(
+            getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        )
+        if reparse_flag and attributes & reparse_flag:
+            raise RuntimeError("Iteration 2 output path contains a reparse point")
     protected = {
-        (root / "results" / ITERATION1_RAW_DIRECTORY).resolve(),
-        (root / "results" / ITERATION1_ANALYSIS_DIRECTORY).resolve(),
+        results_root / ITERATION1_RAW_DIRECTORY,
+        results_root / ITERATION1_ANALYSIS_DIRECTORY,
     }
     if target in protected:
         raise RuntimeError("Iteration 1 output is immutable")

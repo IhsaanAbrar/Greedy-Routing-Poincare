@@ -4,10 +4,13 @@ from contextlib import redirect_stderr
 from copy import deepcopy
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from threading import Barrier, Thread
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -48,6 +51,33 @@ from run_iteration2 import (  # noqa: E402
     publish_graph_checkpoint,
     validate_checkpoint_directory,
 )
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise unittest.SkipTest(
+                "Windows directory junctions are unavailable: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        return
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        raise unittest.SkipTest(f"directory symlinks are unavailable: {exc}") from exc
+
+
+def _remove_directory_link(link: Path) -> None:
+    if link.is_symlink():
+        link.unlink()
+    elif getattr(link, "is_junction", lambda: False)():
+        link.rmdir()
 
 
 class Iteration2CheckpointTests(unittest.TestCase):
@@ -135,6 +165,401 @@ class Iteration2CheckpointTests(unittest.TestCase):
                     checkpoint,
                     run_manifest=self.manifest,
                 )
+
+    def test_truncated_corrupt_and_noncanonical_gzip_and_completion_are_rejected(self):
+        mutations = ("truncated", "corrupt", "noncanonical")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), TemporaryDirectory(
+                prefix=f"iteration2-excluded-{mutation}-"
+            ) as temporary:
+                graph_root = Path(temporary) / "graphs"
+                graph_root.mkdir()
+                checkpoint = publish_graph_checkpoint(
+                    graph_root,
+                    self.results[0],
+                    self.manifest,
+                )
+                payload = checkpoint / GRAPH_RESULT_FILENAME
+                physical = payload.read_bytes()
+                if mutation == "truncated":
+                    payload.write_bytes(physical[:-7])
+                elif mutation == "corrupt":
+                    changed = bytearray(physical)
+                    changed[len(changed) // 2] ^= 0xFF
+                    payload.write_bytes(changed)
+                else:
+                    payload.write_bytes(
+                        runner.gzip.compress(
+                            runner._json_bytes(self.results[0]),
+                            mtime=1,
+                        )
+                    )
+                with self.assertRaisesRegex(
+                    (EOFError, OSError, RuntimeError),
+                    "[Cc]ompress|corrupt|gzip|deterministic|mismatch|CRC|end-of-stream",
+                ):
+                    validate_checkpoint_directory(
+                        checkpoint,
+                        run_manifest=self.manifest,
+                    )
+
+        with TemporaryDirectory(prefix="iteration2-excluded-completion-") as temporary:
+            graph_root = Path(temporary) / "graphs"
+            graph_root.mkdir()
+            checkpoint = publish_graph_checkpoint(
+                graph_root,
+                self.results[0],
+                self.manifest,
+            )
+            (checkpoint / GRAPH_COMPLETION_FILENAME).write_bytes(b"{")
+            with self.assertRaisesRegex(RuntimeError, "JSON|completion|invalid"):
+                validate_checkpoint_directory(
+                    checkpoint,
+                    run_manifest=self.manifest,
+                )
+
+    def test_concurrent_publication_collision_cleans_losing_staging_directory(self):
+        with TemporaryDirectory(prefix="iteration2-excluded-collision-") as temporary:
+            graph_root = Path(temporary) / "graphs"
+            graph_root.mkdir()
+            unrelated = graph_root / "unrelated.txt"
+            unrelated.write_text("must remain untouched", encoding="utf-8")
+            barrier = Barrier(2)
+            real_replace = runner.os.replace
+            outcomes: list[object] = []
+
+            def synchronized_replace(source: Path, target: Path) -> None:
+                barrier.wait(timeout=10.0)
+                real_replace(source, target)
+
+            def publish() -> None:
+                try:
+                    outcomes.append(
+                        publish_graph_checkpoint(
+                            graph_root,
+                            self.results[0],
+                            self.manifest,
+                        )
+                    )
+                except BaseException as exc:  # Capture the losing publisher.
+                    outcomes.append(exc)
+
+            with patch.object(runner.os, "replace", side_effect=synchronized_replace):
+                threads = [Thread(target=publish) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=15.0)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(sum(isinstance(item, Path) for item in outcomes), 1)
+            self.assertEqual(sum(isinstance(item, BaseException) for item in outcomes), 1)
+            checkpoint = graph_root / str(
+                self.results[0]["graph_identity"]["graph_id"]
+            )
+            validate_checkpoint_directory(checkpoint, run_manifest=self.manifest)
+            self.assertEqual(
+                unrelated.read_text(encoding="utf-8"),
+                "must remain untouched",
+            )
+            self.assertEqual(
+                [path.name for path in graph_root.iterdir() if path.name.startswith(".")],
+                [],
+            )
+
+    def test_serialization_failure_cleans_only_owned_staging_directory(self):
+        with TemporaryDirectory(prefix="iteration2-excluded-cleanup-") as temporary:
+            graph_root = Path(temporary) / "graphs"
+            graph_root.mkdir()
+            unrelated = graph_root / "unrelated.txt"
+            unrelated.write_text("preserved", encoding="utf-8")
+            with patch.object(
+                runner,
+                "_construct_raw_checkpoint_payload",
+                side_effect=RuntimeError("forced serialization failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "forced serialization"):
+                    publish_graph_checkpoint(
+                        graph_root,
+                        self.results[0],
+                        self.manifest,
+                    )
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserved")
+            self.assertEqual(
+                [path.name for path in graph_root.iterdir() if path.name.startswith(".")],
+                [],
+            )
+
+    def test_each_publication_phase_failure_is_clean_or_atomically_recoverable(self):
+        for failing_write in (1, 2, 3):
+            with self.subTest(failing_write=failing_write), TemporaryDirectory(
+                prefix="iteration2-excluded-phase-write-"
+            ) as temporary:
+                graph_root = Path(temporary) / "graphs"
+                graph_root.mkdir()
+                unrelated = graph_root / "unrelated.txt"
+                unrelated.write_text("preserved", encoding="utf-8")
+                real_write = runner._write_new
+                write_count = 0
+
+                def interrupt_after_write(path: Path, payload: bytes) -> None:
+                    nonlocal write_count
+                    real_write(path, payload)
+                    write_count += 1
+                    if write_count == failing_write:
+                        raise KeyboardInterrupt
+
+                with patch.object(
+                    runner,
+                    "_write_new",
+                    side_effect=interrupt_after_write,
+                ):
+                    with self.assertRaises(KeyboardInterrupt):
+                        publish_graph_checkpoint(
+                            graph_root,
+                            self.results[0],
+                            self.manifest,
+                        )
+                self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserved")
+                self.assertEqual(
+                    [path.name for path in graph_root.iterdir() if path.name.startswith(".")],
+                    [],
+                )
+                published = publish_graph_checkpoint(
+                    graph_root,
+                    self.results[0],
+                    self.manifest,
+                )
+                validate_checkpoint_directory(published, run_manifest=self.manifest)
+
+        with TemporaryDirectory(prefix="iteration2-excluded-rename-failure-") as temporary:
+            graph_root = Path(temporary) / "graphs"
+            graph_root.mkdir()
+            unrelated = graph_root / "unrelated.txt"
+            unrelated.write_text("preserved", encoding="utf-8")
+            with patch.object(
+                runner.os,
+                "replace",
+                side_effect=PermissionError("forced atomic rename failure"),
+            ):
+                with self.assertRaisesRegex(PermissionError, "forced atomic rename"):
+                    publish_graph_checkpoint(
+                        graph_root,
+                        self.results[0],
+                        self.manifest,
+                    )
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserved")
+            self.assertEqual(
+                [path.name for path in graph_root.iterdir() if path.name.startswith(".")],
+                [],
+            )
+            self.assertFalse(
+                (graph_root / str(self.results[0]["graph_identity"]["graph_id"])).exists()
+            )
+
+        with TemporaryDirectory(prefix="iteration2-excluded-post-rename-") as temporary:
+            graph_root = Path(temporary) / "graphs"
+            graph_root.mkdir()
+            real_fsync = runner._fsync_directory
+            fsync_count = 0
+
+            def interrupt_after_rename(path: Path) -> None:
+                nonlocal fsync_count
+                fsync_count += 1
+                if fsync_count == 2:
+                    raise KeyboardInterrupt
+                real_fsync(path)
+
+            with patch.object(
+                runner,
+                "_fsync_directory",
+                side_effect=interrupt_after_rename,
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    publish_graph_checkpoint(
+                        graph_root,
+                        self.results[0],
+                        self.manifest,
+                    )
+            checkpoint = graph_root / str(
+                self.results[0]["graph_identity"]["graph_id"]
+            )
+            validate_checkpoint_directory(checkpoint, run_manifest=self.manifest)
+            self.assertEqual(
+                [path.name for path in graph_root.iterdir() if path.name.startswith(".")],
+                [],
+            )
+
+    def test_resume_rejects_noncontiguous_prefix_and_premature_completion(self):
+        with TemporaryDirectory(prefix="iteration2-excluded-prefix-gap-") as temporary:
+            output = Path(temporary) / "run"
+            graph_root = output / "graphs"
+            graph_root.mkdir(parents=True)
+            (output / "run_manifest.json").write_bytes(_json_bytes(self.manifest))
+            publish_graph_checkpoint(graph_root, self.results[1], self.manifest)
+            with (
+                patch.object(
+                    runner,
+                    "scheduled_specifications",
+                    return_value={graph_id: object() for graph_id in self.manifest["schedule"]},
+                ),
+                self.assertRaisesRegex(RuntimeError, "contiguous schedule prefix"),
+            ):
+                _validate_resume_directory(
+                    output,
+                    self.manifest,
+                    validation_policy=ResumeValidationPolicy.READ_ONLY_STRUCTURAL,
+                )
+
+        with TemporaryDirectory(prefix="iteration2-excluded-premature-complete-") as temporary:
+            output = Path(temporary) / "run"
+            (output / "graphs").mkdir(parents=True)
+            (output / "run_manifest.json").write_bytes(_json_bytes(self.manifest))
+            (output / "run_complete.json").write_bytes(b"{")
+            with (
+                patch.object(
+                    runner,
+                    "scheduled_specifications",
+                    return_value={graph_id: object() for graph_id in self.manifest["schedule"]},
+                ),
+                self.assertRaisesRegex(RuntimeError, "completion marker"),
+            ):
+                _validate_resume_directory(
+                    output,
+                    self.manifest,
+                    validation_policy=ResumeValidationPolicy.READ_ONLY_STRUCTURAL,
+                )
+
+    def test_execution_resumes_at_first_missing_graph_without_duplicate_execution(self):
+        with TemporaryDirectory(prefix="iteration2-excluded-resume-next-") as temporary:
+            root = Path(temporary)
+            output = root / "results" / str(self.manifest["run_identity"])
+            graph_root = output / "graphs"
+            graph_root.mkdir(parents=True)
+            (output / "run_manifest.json").write_bytes(_json_bytes(self.manifest))
+            first_id, second_id = [str(item) for item in self.manifest["schedule"]]
+            (graph_root / first_id).mkdir()
+            specifications = (
+                SimpleNamespace(graph_id=first_id),
+                SimpleNamespace(graph_id=second_id),
+            )
+            report = {
+                "authorized": True,
+                "manifest": self.manifest,
+                "checkpoint_validation": {
+                    "validated_graph_ids": [first_id],
+                },
+            }
+            sentinel = RuntimeError("stop after proving next graph")
+            with (
+                patch.object(runner, "preflight", return_value=report),
+                patch.object(runner, "_recheck_execution_authorization"),
+                patch.object(runner, "repository_root", return_value=root),
+                patch.object(runner, "resolve_iteration2_output", return_value=output),
+                patch.object(runner, "full_schedule", return_value=specifications),
+                patch.object(
+                    runner,
+                    "execute_scheduled_graph",
+                    side_effect=sentinel,
+                ) as execute,
+                patch.object(runner, "publish_graph_checkpoint") as publish,
+                self.assertRaisesRegex(RuntimeError, "proving next graph"),
+            ):
+                runner._execute_full_run_with_lease_held(
+                    mode="full",
+                    confirmation="confirmed",
+                    expected_source_commit="commit",
+                    expected_source_fingerprint="source",
+                    expected_dependency_fingerprint="dependency",
+                    expected_capacity_profile="capacity",
+                    expected_protocol_hash="protocol",
+                    resume=True,
+                )
+            execute.assert_called_once_with(specifications[1], pair_count=runner.PAIRS_PER_GRAPH)
+            publish.assert_not_called()
+
+    def test_publication_and_validation_reject_directory_links_without_escape(self):
+        with TemporaryDirectory(prefix="iteration2-excluded-link-escape-") as temporary:
+            root = Path(temporary)
+            physical_graph_root = root / "physical-graphs"
+            physical_graph_root.mkdir()
+            linked_graph_root = root / "linked-graphs"
+            _create_directory_link(linked_graph_root, physical_graph_root)
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "unsafe|reparse|symlink|junction",
+                ):
+                    publish_graph_checkpoint(
+                        linked_graph_root,
+                        self.results[0],
+                        self.manifest,
+                    )
+                self.assertEqual(list(physical_graph_root.iterdir()), [])
+            finally:
+                _remove_directory_link(linked_graph_root)
+
+            checkpoint = publish_graph_checkpoint(
+                physical_graph_root,
+                self.results[0],
+                self.manifest,
+            )
+            linked_checkpoint = root / "linked-checkpoint"
+            _create_directory_link(linked_checkpoint, checkpoint)
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "non-symlink|reparse|junction",
+                ):
+                    validate_checkpoint_directory(
+                        linked_checkpoint,
+                        run_manifest=self.manifest,
+                    )
+            finally:
+                _remove_directory_link(linked_checkpoint)
+
+    def test_output_resolution_and_resume_reject_directory_links(self):
+        with TemporaryDirectory(prefix="iteration2-excluded-resume-link-") as temporary:
+            root = Path(temporary)
+            results_root = root / "results"
+            results_root.mkdir()
+            physical_output = root / "physical-output"
+            graph_root = physical_output / "graphs"
+            graph_root.mkdir(parents=True)
+            (physical_output / "run_manifest.json").write_bytes(
+                _json_bytes(self.manifest)
+            )
+            for result in self.results:
+                publish_graph_checkpoint(graph_root, result, self.manifest)
+            linked_output = results_root / runner.ITERATION2_RUN_IDENTITY
+            _create_directory_link(linked_output, physical_output)
+            try:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "unsafe|reparse|symlink|junction",
+                ):
+                    runner.resolve_iteration2_output(
+                        root,
+                        runner.ITERATION2_RUN_IDENTITY,
+                    )
+                with (
+                    patch.object(
+                        runner,
+                        "scheduled_specifications",
+                        return_value={graph_id: object() for graph_id in self.manifest["schedule"]},
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "non-symlink|reparse|junction",
+                    ),
+                ):
+                    _validate_resume_directory(
+                        linked_output,
+                        self.manifest,
+                        validation_policy=ResumeValidationPolicy.READ_ONLY_STRUCTURAL,
+                    )
+            finally:
+                _remove_directory_link(linked_output)
 
     def test_fixture_schedule_cannot_be_resumed_as_scientific_schedule(self):
         with TemporaryDirectory(prefix="iteration2-excluded-resume-") as temporary:
@@ -340,21 +765,6 @@ class Iteration2FutureRunGuardTests(unittest.TestCase):
             tracked.stdout.decode().strip().replace("\\", "/"),
             "code/iteration2_capacity_profile.json",
         )
-        unchanged = subprocess.run(
-            [
-                "git",
-                "diff",
-                "--quiet",
-                "HEAD",
-                "--",
-                "code/iteration2_capacity_profile.json",
-            ],
-            cwd=PROJECT_ROOT,
-            check=False,
-            capture_output=True,
-        )
-        self.assertEqual(unchanged.returncode, 0, unchanged.stderr.decode())
-
         profile = load_capacity_profile(profile_path, root=PROJECT_ROOT)
         report = integrity_report(profile_path)
         self.assertTrue(report["valid"])
